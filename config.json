@@ -1,0 +1,57 @@
+{
+    "video_settings": {
+        "width": 480,
+        "height": 854,
+        "fps": 30,
+        "codec": "libx264",
+        "audio_codec": "aac"
+    },
+    "background": {
+        "type": "gradient",
+        "colors": {
+            "top": [200, 100, 50],
+            "bottom": [100, 50, 20]
+        }
+    },
+    "logos": {
+        "rummerlab": {
+            "url": "https://rummerlab.com/images/rummerlab_logo_transparent.png",
+            "position": "top-left",
+            "max_height": 200,
+            "max_width": 160,
+            "margin": 60
+        },
+        "physioshark": {
+            "url": "https://physioshark.org/images/logo-physioshark-project.png",
+            "position": "top-right",
+            "max_height": 180,
+            "max_width": 160,
+            "margin": 60
+        }
+    },
+    "captions": {
+        "font_size": 60,
+        "font_color": "white",
+        "stroke_color": "black",
+        "stroke_width": 3,
+        "position": "bottom",
+        "max_width": 980,
+        "words_per_segment": 5
+    },
+    "audio_visualization": {
+        "enabled": true,
+        "position": "bottom",
+        "height": 80,
+        "bar_width": 8,
+        "bar_spacing": 4,
+        "bar_color": [255, 255, 255],
+        "bar_alpha": 0.7,
+        "num_bars": 50,
+        "sensitivity": 1.5,
+        "smoothness": 0.3
+    },
+    "whisper": {
+        "model": "base",
+        "language": null
+    }
+}
