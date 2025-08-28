@@ -127,6 +127,9 @@ class MP3ToMP4Converter:
         if "colors" not in config["background"]:
             config["background"]["colors"] = {}
         
+        # Check for transparent background setting
+        config["transparent_background"] = os.getenv("TRANSPARENT_BACKGROUND", "false").lower() == "true"
+        
         config["background"]["colors"]["top"] = [
             int(os.getenv("BG_TOP_RED", config.get("background", {}).get("colors", {}).get("top", [100, 50, 20])[0])),
             int(os.getenv("BG_TOP_GREEN", config.get("background", {}).get("colors", {}).get("top", [100, 50, 20])[1])),
@@ -340,8 +343,8 @@ class MP3ToMP4Converter:
         num_bars = viz_config.get("num_bars", 50)
         bar_width = viz_config.get("bar_width", 8)
         bar_spacing = viz_config.get("bar_spacing", 4)
-        bar_color = viz_config.get("bar_color", [255, 255, 255])
-        bar_alpha = viz_config.get("bar_alpha", 0.7)
+        bar_color = viz_config.get("bar_color", [200, 200, 255])  # Lighter blue-white color
+        bar_alpha = viz_config.get("bar_alpha", 0.4)  # More transparent
         viz_height = viz_config.get("height", 80)
         sensitivity = viz_config.get("sensitivity", 1.5)
         
@@ -457,8 +460,16 @@ class MP3ToMP4Converter:
             return -80
         
         def make_viz_frame(t):
-            # Create frame with transparent background
-            frame = np.zeros((viz_height, self.video_width, 3), dtype=np.uint8)
+            # Check if we need transparent background
+            transparent_bg = self.config.get("transparent_background", False)
+            
+            if transparent_bg:
+                # Create RGBA frame with transparency
+                frame = np.zeros((viz_height, self.video_width, 4), dtype=np.uint8)
+                frame[:, :, 3] = 0  # Set alpha to 0 (transparent)
+            else:
+                # Create frame with subtle background that will blend with the gradient
+                frame = np.zeros((viz_height, self.video_width, 3), dtype=np.uint8)
             
             # Create frequency-based bars
             for i in range(num_bars):
@@ -502,7 +513,13 @@ class MP3ToMP4Converter:
                                 g = int(bar_color[1] * color_intensity)
                                 b = int(bar_color[2] * color_intensity * (0.8 + 0.2 * (1 - freq_factor)))
                                 
-                                frame[viz_height - 1 - y, x + x_offset] = [r, g, b]
+                                if transparent_bg:
+                                    # Set RGBA values with alpha based on intensity
+                                    alpha = int(255 * color_intensity)
+                                    frame[viz_height - 1 - y, x + x_offset] = [r, g, b, alpha]
+                                else:
+                                    # Set RGB values with subtle background that will blend
+                                    frame[viz_height - 1 - y, x + x_offset] = [r, g, b]
             
             return frame
         
@@ -513,27 +530,41 @@ class MP3ToMP4Converter:
         """Create a background video with gradient and logos"""
         bg_config = self.config["background"]
         
-        # Create gradient background
-        def make_frame(t):
-            # Create a gradient from top to bottom
-            frame = np.zeros((self.video_height, self.video_width, 3), dtype=np.uint8)
-            
-            # Use colors from config
-            top_color = bg_config["colors"]["top"]
-            bottom_color = bg_config["colors"]["bottom"]
-            
-            for y in range(self.video_height):
-                ratio = y / self.video_height
-                # Interpolate between top and bottom colors
-                red = int(top_color[0] + ratio * (bottom_color[0] - top_color[0]))
-                green = int(top_color[1] + ratio * (bottom_color[1] - top_color[1]))
-                blue = int(top_color[2] + ratio * (bottom_color[2] - top_color[2]))
-                
-                frame[y, :] = [blue, green, red]  # OpenCV uses BGR order
-            
-            return frame
+        # Check if we want transparent background
+        transparent_bg = self.config.get("transparent_background", False)
         
-        background = VideoClip(make_frame, duration=duration)
+        if transparent_bg:
+            # Create transparent background
+            def make_frame(t):
+                # Create a transparent frame (RGBA with alpha=0)
+                frame = np.zeros((self.video_height, self.video_width, 4), dtype=np.uint8)
+                frame[:, :, 3] = 0  # Set alpha to 0 (transparent)
+                return frame
+            
+            background = VideoClip(make_frame, duration=duration)
+        else:
+            # Create gradient background (original behavior)
+            def make_frame(t):
+                # Create a gradient from top to bottom
+                frame = np.zeros((self.video_height, self.video_width, 3), dtype=np.uint8)
+                
+                # Use colors from config
+                top_color = bg_config["colors"]["top"]
+                bottom_color = bg_config["colors"]["bottom"]
+                
+                for y in range(self.video_height):
+                    ratio = y / self.video_height
+                    # Interpolate between top and bottom colors
+                    red = int(top_color[0] + ratio * (bottom_color[0] - top_color[0]))
+                    green = int(top_color[1] + ratio * (bottom_color[1] - top_color[1]))
+                    blue = int(top_color[2] + ratio * (bottom_color[2] - top_color[2]))
+                    
+                    frame[y, :] = [blue, green, red]  # OpenCV uses BGR order
+                
+                return frame
+            
+            background = VideoClip(make_frame, duration=duration)
+        
         return background
     
     def add_logos_to_video(self, video: VideoClip, logo_paths: dict) -> VideoClip:
@@ -680,10 +711,24 @@ class MP3ToMP4Converter:
             
             # Write output file
             logger.info(f"Writing {output_filename}...")
+            
+            # Check if we need transparent output
+            transparent_bg = self.config.get("transparent_background", False)
+            
+            if transparent_bg:
+                # Use codec that supports alpha channel
+                codec = "libx264"  # or "prores_ks" for better alpha support
+                # Note: For true alpha support, you might want to use .mov format
+                # and prores_ks codec, but libx264 can work with some limitations
+                output_path = output_path.with_suffix('.mov')
+                logger.info(f"Writing transparent video to {output_path.name}...")
+            else:
+                codec = self.config["video_settings"]["codec"]
+            
             final_video.write_videofile(
                 str(output_path),
                 fps=self.fps,
-                codec=self.config["video_settings"]["codec"],
+                codec=codec,
                 audio_codec=self.config["video_settings"]["audio_codec"],
                 temp_audiofile='temp-audio.m4a',
                 remove_temp=True,
@@ -701,6 +746,15 @@ class MP3ToMP4Converter:
             
         except Exception as e:
             logger.error(f"Failed to convert {mp3_path.name}: {e}")
+            
+            # Clean up any partial output file that may have been created
+            if output_path.exists():
+                try:
+                    output_path.unlink()
+                    logger.info(f"Cleaned up failed output file: {output_filename}")
+                except Exception as cleanup_error:
+                    logger.warning(f"Could not clean up failed output file {output_filename}: {cleanup_error}")
+            
             return False
     
     def process_all_files(self, force: bool = False) -> None:

@@ -6,6 +6,7 @@ A Python script that converts MP3 audio files to MP4 videos optimized for social
 - **Auto-generated captions** using OpenAI's Whisper speech recognition
 - **Brand logos** automatically added to videos
 - **Ocean-themed gradient background** fitting for marine biology content
+- **Transparent background support** for overlay videos
 - **Batch processing** with skip/force options
 
 ## Features
@@ -86,9 +87,10 @@ python mp3_to_mp4_converter.py -i /path/to/input -o /path/to/output -f
 - **Frame rate**: 30 FPS
 - **Codec**: H.264 video, AAC audio
 - **Aspect ratio**: 9:16 (optimized for mobile/social media)
-- **Background**: Ocean-themed gradient (blue tones)
+- **Background**: Ocean-themed gradient (blue tones) or transparent
 - **Logos**: RummerLab (top-left) and PhysioShark (top-right)
 - **Captions**: White text with black outline, positioned at bottom
+- **Transparency**: Optional alpha channel support for overlay videos
 
 ## Logo Sources
 
@@ -113,6 +115,7 @@ python setup_env.py
 - **`ENABLE_LOGOS`**: Enable/disable logos (true/false)
 - **`BG_TOP_RED/GREEN/BLUE`**: Background gradient top color (RGB)
 - **`BG_BOTTOM_RED/GREEN/BLUE`**: Background gradient bottom color (RGB)
+- **`TRANSPARENT_BACKGROUND`**: Enable transparent background (true/false)
 
 See `env.template` for all available options.
 
@@ -129,6 +132,29 @@ The script uses OpenAI's Whisper model to:
 - **Local Whisper**: Uses local model (requires more disk space)
 - **OpenAI API**: Uses cloud API (requires API key, faster)
 - **Disabled**: Skip captions entirely
+
+### Transparent Background
+
+To create videos with transparent backgrounds (useful for overlays):
+
+1. **Set environment variable**:
+   ```bash
+   export TRANSPARENT_BACKGROUND=true
+   ```
+
+2. **Or modify config.json**:
+   ```json
+   {
+     "transparent_background": true
+   }
+   ```
+
+3. **Output format**: Videos will be saved as `.mov` files with alpha channel support
+
+**Note**: Transparent videos are ideal for:
+- Overlaying on other videos
+- Creating video effects
+- Professional video editing workflows
 
 ## Troubleshooting
 

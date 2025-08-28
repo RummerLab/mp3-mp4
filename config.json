@@ -13,6 +13,7 @@
             "bottom": [100, 50, 20]
         }
     },
+    "transparent_background": true,
     "logos": {
         "rummerlab": {
             "url": "https://rummerlab.com/images/rummerlab_logo_transparent.png",
