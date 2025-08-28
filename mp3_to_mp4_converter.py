@@ -208,7 +208,8 @@ class MP3ToMP4Converter:
         logo_paths = {}
         
         for name, logo_config in self.config["logos"].items():
-            logo_path = self.output_folder / f"{name}_logo.png"
+            # Download logos to root directory instead of output folder
+            logo_path = Path(f"{name}_logo.png")
             
             if not logo_path.exists():
                 try:
@@ -219,7 +220,7 @@ class MP3ToMP4Converter:
                     with open(logo_path, 'wb') as f:
                         f.write(response.content)
                     
-                    logger.info(f"Downloaded {name} logo successfully")
+                    logger.info(f"Downloaded {name} logo successfully to {logo_path}")
                 except Exception as e:
                     logger.error(f"Failed to download {name} logo: {e}")
                     continue
@@ -340,13 +341,23 @@ class MP3ToMP4Converter:
             return None
         
         # Parameters from config
-        num_bars = viz_config.get("num_bars", 50)
-        bar_width = viz_config.get("bar_width", 8)
-        bar_spacing = viz_config.get("bar_spacing", 4)
-        bar_color = viz_config.get("bar_color", [200, 200, 255])  # Lighter blue-white color
-        bar_alpha = viz_config.get("bar_alpha", 0.4)  # More transparent
-        viz_height = viz_config.get("height", 80)
-        sensitivity = viz_config.get("sensitivity", 1.5)
+        num_bars = viz_config.get("num_bars", 60)
+        bar_width = viz_config.get("bar_width", 6)
+        bar_spacing = viz_config.get("bar_spacing", 3)
+        bar_color = viz_config.get("bar_color", [100, 200, 255])
+        bar_alpha = viz_config.get("bar_alpha", 0.8)
+        viz_height = viz_config.get("height", 120)
+        sensitivity = viz_config.get("sensitivity", 2.0)
+        
+        # Enhanced visualization features
+        gradient_enabled = viz_config.get("gradient", {}).get("enabled", True)
+        glow_enabled = viz_config.get("glow", {}).get("enabled", True)
+        background_enabled = viz_config.get("background", {}).get("enabled", True)
+        
+        # Background settings
+        bg_height = viz_config.get("background", {}).get("height", 140)
+        bg_color = viz_config.get("background", {}).get("color", [0, 0, 0, 150])
+        bg_blur = viz_config.get("background", {}).get("blur", 10)
         
         # Advanced audio analysis using STFT
         frequency_data = None
@@ -460,30 +471,44 @@ class MP3ToMP4Converter:
             return -80
         
         def make_viz_frame(t):
-            # Check if we need transparent background
-            transparent_bg = self.config.get("transparent_background", False)
-            
-            if transparent_bg:
-                # Create RGBA frame with transparency
-                frame = np.zeros((viz_height, self.video_width, 4), dtype=np.uint8)
-                frame[:, :, 3] = 0  # Set alpha to 0 (transparent)
+            # Create frame with background if enabled
+            if background_enabled:
+                # Create larger frame to accommodate background
+                frame = np.zeros((bg_height, self.video_width, 3), dtype=np.uint8)
+                
+                # Create background bar
+                bg_y_start = bg_height - viz_height - 20
+                bg_y_end = bg_height - 10
+                
+                # Draw semi-transparent background
+                for y in range(bg_y_start, bg_y_end):
+                    for x in range(self.video_width):
+                        # Create gradient background
+                        bg_ratio = (y - bg_y_start) / (bg_y_end - bg_y_start)
+                        bg_r = int(bg_color[0] * bg_ratio)
+                        bg_g = int(bg_color[1] * bg_ratio)
+                        bg_b = int(bg_color[2] * bg_ratio)
+                        frame[y, x] = [bg_b, bg_g, bg_r]  # BGR order
+                
+                # Set visualization area
+                viz_y_offset = bg_y_start
             else:
-                # Create frame with subtle background that will blend with the gradient
                 frame = np.zeros((viz_height, self.video_width, 3), dtype=np.uint8)
+                viz_y_offset = 0
             
             # Create frequency-based bars
             for i in range(num_bars):
-                # Map bar index to frequency range (100Hz to 8000Hz like in the article)
-                freq = 100 + (i / num_bars) * 7900  # 100Hz to 8000Hz
+                # Map bar index to frequency range (100Hz to 8000Hz)
+                freq = 100 + (i / num_bars) * 7900
                 
                 # Get decibel value for this frequency and time
                 decibel = get_decibel(t, freq)
                 
-                # Convert decibel to height (similar to article's approach)
+                # Convert decibel to height
                 min_decibel = -80
                 max_decibel = 0
-                min_height = 2
-                max_height = viz_height * 0.8
+                min_height = 3
+                max_height = viz_height * 0.9
                 
                 # Calculate height based on decibel
                 if decibel > min_decibel:
@@ -499,27 +524,69 @@ class MP3ToMP4Converter:
                 if wave_height > 0:
                     x = start_x + i * (bar_width + bar_spacing)
                     
-                    # Draw bar with gradient effect
+                    # Draw bar with enhanced effects
                     for y in range(max(0, wave_height)):
                         for x_offset in range(bar_width):
                             if x + x_offset < self.video_width and y < viz_height:
                                 # Create gradient effect - brighter at the top
                                 gradient_factor = 1.0 - (y / max(wave_height, 1))
-                                color_intensity = bar_alpha * (0.5 + 0.5 * gradient_factor)
                                 
-                                # Add some color variation based on frequency
-                                freq_factor = i / num_bars
-                                r = int(bar_color[0] * color_intensity * (0.8 + 0.2 * freq_factor))
-                                g = int(bar_color[1] * color_intensity)
-                                b = int(bar_color[2] * color_intensity * (0.8 + 0.2 * (1 - freq_factor)))
-                                
-                                if transparent_bg:
-                                    # Set RGBA values with alpha based on intensity
-                                    alpha = int(255 * color_intensity)
-                                    frame[viz_height - 1 - y, x + x_offset] = [r, g, b, alpha]
+                                # Enhanced color calculation
+                                if gradient_enabled:
+                                    top_color = viz_config.get("gradient", {}).get("top_color", [150, 220, 255])
+                                    bottom_color = viz_config.get("gradient", {}).get("bottom_color", [80, 160, 220])
+                                    
+                                    # Interpolate between top and bottom colors
+                                    r = int(top_color[0] + gradient_factor * (bottom_color[0] - top_color[0]))
+                                    g = int(top_color[1] + gradient_factor * (bottom_color[1] - top_color[1]))
+                                    b = int(top_color[2] + gradient_factor * (bottom_color[2] - top_color[2]))
                                 else:
-                                    # Set RGB values with subtle background that will blend
-                                    frame[viz_height - 1 - y, x + x_offset] = [r, g, b]
+                                    # Use single color with intensity variation
+                                    color_intensity = bar_alpha * (0.6 + 0.4 * gradient_factor)
+                                    r = int(bar_color[0] * color_intensity)
+                                    g = int(bar_color[1] * color_intensity)
+                                    b = int(bar_color[2] * color_intensity)
+                                
+                                # Add glow effect
+                                if glow_enabled:
+                                    glow_intensity = viz_config.get("glow", {}).get("intensity", 0.3)
+                                    glow_color = viz_config.get("glow", {}).get("color", [100, 200, 255])
+                                    
+                                    # Add glow around the bar
+                                    glow_factor = max(0, 1.0 - (y / max(wave_height, 1))) * glow_intensity
+                                    r = min(255, r + int(glow_color[0] * glow_factor))
+                                    g = min(255, g + int(glow_color[1] * glow_factor))
+                                    b = min(255, b + int(glow_color[2] * glow_factor))
+                                
+                                # Add frequency-based color variation
+                                freq_factor = i / num_bars
+                                r = min(255, r + int(20 * freq_factor))
+                                b = min(255, b + int(20 * (1 - freq_factor)))
+                                
+                                # Clamp values
+                                r = max(0, min(255, r))
+                                g = max(0, min(255, g))
+                                b = max(0, min(255, b))
+                                
+                                # Set pixel
+                                frame[viz_y_offset + viz_height - 1 - y, x + x_offset] = [b, g, r]  # BGR order
+                                
+                                # Add subtle glow effect to surrounding pixels
+                                if glow_enabled and y < wave_height * 0.3:  # Only for top portion
+                                    for dx in [-1, 1]:
+                                        for dy in [-1, 1]:
+                                            glow_x = x + x_offset + dx
+                                            glow_y = viz_y_offset + viz_height - 1 - y + dy
+                                            if (0 <= glow_x < self.video_width and 
+                                                0 <= glow_y < frame.shape[0]):
+                                                # Blend with existing pixel
+                                                existing = frame[glow_y, glow_x]
+                                                glow_blend = 0.3
+                                                frame[glow_y, glow_x] = [
+                                                    int(existing[0] * (1 - glow_blend) + b * glow_blend),
+                                                    int(existing[1] * (1 - glow_blend) + g * glow_blend),
+                                                    int(existing[2] * (1 - glow_blend) + r * glow_blend)
+                                                ]
             
             return frame
         
@@ -527,7 +594,7 @@ class MP3ToMP4Converter:
         return viz_clip
     
     def create_background_video(self, duration: float) -> VideoClip:
-        """Create a background video with gradient and logos"""
+        """Create a background video with enhanced gradient and subtle effects"""
         bg_config = self.config["background"]
         
         # Check if we want transparent background
@@ -543,7 +610,7 @@ class MP3ToMP4Converter:
             
             background = VideoClip(make_frame, duration=duration)
         else:
-            # Create gradient background (original behavior)
+            # Create enhanced gradient background with subtle effects
             def make_frame(t):
                 # Create a gradient from top to bottom
                 frame = np.zeros((self.video_height, self.video_width, 3), dtype=np.uint8)
@@ -552,14 +619,48 @@ class MP3ToMP4Converter:
                 top_color = bg_config["colors"]["top"]
                 bottom_color = bg_config["colors"]["bottom"]
                 
+                # Add subtle animation to the gradient
+                time_factor = np.sin(t * 0.5) * 0.05  # Subtle breathing effect
+                
                 for y in range(self.video_height):
                     ratio = y / self.video_height
-                    # Interpolate between top and bottom colors
-                    red = int(top_color[0] + ratio * (bottom_color[0] - top_color[0]))
-                    green = int(top_color[1] + ratio * (bottom_color[1] - top_color[1]))
-                    blue = int(top_color[2] + ratio * (bottom_color[2] - top_color[2]))
+                    
+                    # Add subtle horizontal variation
+                    x_factor = np.sin(y * 0.01 + t * 0.3) * 0.02
+                    
+                    # Interpolate between top and bottom colors with subtle variations
+                    red = int(top_color[0] + ratio * (bottom_color[0] - top_color[0]) + time_factor * 10 + x_factor * 5)
+                    green = int(top_color[1] + ratio * (bottom_color[1] - top_color[1]) + time_factor * 8 + x_factor * 3)
+                    blue = int(top_color[2] + ratio * (bottom_color[2] - top_color[2]) + time_factor * 12 + x_factor * 4)
+                    
+                    # Clamp values to valid range
+                    red = max(0, min(255, red))
+                    green = max(0, min(255, green))
+                    blue = max(0, min(255, blue))
                     
                     frame[y, :] = [blue, green, red]  # OpenCV uses BGR order
+                
+                # Add subtle overlay pattern if enabled
+                if bg_config.get("overlay", {}).get("enabled", False):
+                    overlay_opacity = bg_config["overlay"].get("opacity", 0.1)
+                    pattern_type = bg_config["overlay"].get("type", "subtle_pattern")
+                    
+                    if pattern_type == "subtle_pattern":
+                        # Create subtle diagonal lines
+                        for y in range(0, self.video_height, 20):
+                            for x in range(0, self.video_width, 20):
+                                if (x + y) % 40 == 0:
+                                    # Add subtle diagonal pattern
+                                    for i in range(10):
+                                        px = x + i
+                                        py = y + i
+                                        if px < self.video_width and py < self.video_height:
+                                            # Add subtle brightness variation
+                                            frame[py, px] = [
+                                                min(255, frame[py, px, 0] + int(overlay_opacity * 20)),
+                                                min(255, frame[py, px, 1] + int(overlay_opacity * 20)),
+                                                min(255, frame[py, px, 2] + int(overlay_opacity * 20))
+                                            ]
                 
                 return frame
             
@@ -568,7 +669,7 @@ class MP3ToMP4Converter:
         return background
     
     def add_logos_to_video(self, video: VideoClip, logo_paths: dict) -> VideoClip:
-        """Add logos to the video"""
+        """Add logos to the video with enhanced styling"""
         if not logo_paths:
             return video
         
@@ -584,7 +685,7 @@ class MP3ToMP4Converter:
                     
                     # Resize logo based on config with auto-scaling
                     max_height = logo_config["max_height"]
-                    max_width = logo_config.get("max_width", self.video_width * 0.4)  # Use config or default to 40% of video width
+                    max_width = logo_config.get("max_width", self.video_width * 0.4)
                     
                     # Calculate aspect ratio
                     aspect_ratio = logo_img.width / logo_img.height
@@ -599,6 +700,57 @@ class MP3ToMP4Converter:
                         new_height = int(new_width / aspect_ratio)
                     
                     logo_img = logo_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                    
+                    # Add shadow effect if enabled
+                    shadow_config = logo_config.get("shadow", {})
+                    if shadow_config.get("enabled", False):
+                        # Create shadow image
+                        shadow_offset = shadow_config.get("offset", 2)
+                        shadow_blur = shadow_config.get("blur", 4)
+                        shadow_color = shadow_config.get("color", [0, 0, 0, 100])
+                        
+                        # Create shadow by duplicating the logo with shadow color
+                        shadow_img = logo_img.copy()
+                        
+                        # Apply shadow color to non-transparent pixels
+                        if shadow_img.mode == 'RGBA':
+                            data = np.array(shadow_img)
+                            # Create shadow effect for non-transparent pixels
+                            alpha_mask = data[:, :, 3] > 0
+                            data[alpha_mask, 0] = shadow_color[0]  # R
+                            data[alpha_mask, 1] = shadow_color[1]  # G
+                            data[alpha_mask, 2] = shadow_color[2]  # B
+                            data[alpha_mask, 3] = shadow_color[3]  # A
+                            shadow_img = Image.fromarray(data)
+                        
+                        # Create shadow clip
+                        shadow_array = np.array(shadow_img)
+                        shadow_clip = ImageClip(shadow_array).set_duration(video.duration)
+                        
+                        # Position shadow slightly offset
+                        position = logo_config["position"]
+                        margin = logo_config["margin"]
+                        
+                        if "left" in position:
+                            x = margin + shadow_offset
+                        elif "right" in position:
+                            x = self.video_width - new_width - margin + shadow_offset
+                        elif "center" in position:
+                            x = (self.video_width - new_width) // 2 + shadow_offset
+                        else:
+                            x = (self.video_width - new_width) // 2 + shadow_offset
+                        
+                        if "top" in position:
+                            y = margin + shadow_offset
+                        elif "bottom" in position:
+                            y = self.video_height - new_height - margin + shadow_offset
+                        elif "center" in position and "top" not in position and "bottom" not in position:
+                            y = (self.video_height - new_height) // 2 + shadow_offset
+                        else:
+                            y = (self.video_height - new_height) // 2 + shadow_offset
+                        
+                        shadow_clip = shadow_clip.set_position((x, y))
+                        logo_clips.append(shadow_clip)
                     
                     # Convert to numpy array
                     logo_array = np.array(logo_img)
@@ -700,8 +852,17 @@ class MP3ToMP4Converter:
             # Combine video, audio visualization, and captions
             video_clips = [video_with_logos]
             if audio_viz:
-                # Position audio visualization at the bottom
-                viz_y = self.video_height - audio_viz.h - 50  # 50px margin from bottom
+                # Position audio visualization at the bottom with proper spacing
+                viz_config = self.config.get("audio_visualization", {})
+                background_enabled = viz_config.get("background", {}).get("enabled", True)
+                
+                if background_enabled:
+                    # Position with background - it will extend below the main video
+                    viz_y = self.video_height - 20  # 20px margin from bottom
+                else:
+                    # Position without background
+                    viz_y = self.video_height - audio_viz.h - 50  # 50px margin from bottom
+                
                 audio_viz = audio_viz.set_position((0, viz_y))
                 video_clips.append(audio_viz)
             video_clips.extend(caption_clips)

@@ -11,23 +11,40 @@
         "colors": {
             "top": [200, 100, 50],
             "bottom": [100, 50, 20]
+        },
+        "overlay": {
+            "enabled": true,
+            "type": "subtle_pattern",
+            "opacity": 0.1
         }
     },
-    "transparent_background": true,
+    "transparent_background": false,
     "logos": {
         "rummerlab": {
             "url": "https://rummerlab.com/images/rummerlab_logo_transparent.png",
             "position": "top-left",
-            "max_height": 200,
-            "max_width": 160,
-            "margin": 60
+            "max_height": 180,
+            "max_width": 140,
+            "margin": 40,
+            "shadow": {
+                "enabled": false,
+                "offset": 1,
+                "blur": 4,
+                "color": [0, 0, 0, 100]
+            }
         },
         "physioshark": {
             "url": "https://physioshark.org/images/logo-physioshark-project.png",
             "position": "top-right",
-            "max_height": 180,
-            "max_width": 160,
-            "margin": 60
+            "max_height": 160,
+            "max_width": 140,
+            "margin": 40,
+            "shadow": {
+                "enabled": false,
+                "offset": 1,
+                "blur": 4,
+                "color": [0, 0, 0, 100]
+            }
         }
     },
     "captions": {
@@ -42,14 +59,30 @@
     "audio_visualization": {
         "enabled": true,
         "position": "bottom",
-        "height": 80,
-        "bar_width": 8,
-        "bar_spacing": 4,
-        "bar_color": [255, 255, 255],
-        "bar_alpha": 0.7,
-        "num_bars": 50,
-        "sensitivity": 1.5,
-        "smoothness": 0.3
+        "height": 120,
+        "bar_width": 6,
+        "bar_spacing": 3,
+        "bar_color": [100, 200, 255],
+        "bar_alpha": 0.8,
+        "num_bars": 60,
+        "sensitivity": 2.0,
+        "smoothness": 0.3,
+        "gradient": {
+            "enabled": true,
+            "top_color": [150, 220, 255],
+            "bottom_color": [80, 160, 220]
+        },
+        "glow": {
+            "enabled": true,
+            "intensity": 0.3,
+            "color": [100, 200, 255]
+        },
+        "background": {
+            "enabled": true,
+            "color": [0, 0, 0, 150],
+            "height": 140,
+            "blur": 10
+        }
     },
     "whisper": {
         "model": "base",
