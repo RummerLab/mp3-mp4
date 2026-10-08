@@ -1,957 +1,543 @@
 #!/usr/bin/env python3
 """
 MP3 to MP4 Converter for Social Media
-Converts MP3 files to MP4 videos with logos and auto-generated captions
-Optimized for portrait format (reels/shorts)
+
+Turns an audio clip (mp3, m4a, wav, ...) into a vertical 1080x1920 video for
+YouTube Shorts, Instagram Reels and TikTok: ocean gradient, RummerLab and
+PhysioShark logos, a title card, an audio visualiser and word-by-word captions.
+
+Captions come from a local faster-whisper transcription (cached next to the
+output), and frames are rendered by ffmpeg, so re-rendering after a text tweak
+takes seconds.
 """
 
-import os
-import sys
 import argparse
-import requests
-from pathlib import Path
-from typing import List, Optional
-import subprocess
+import copy
+import functools
 import json
-import re
-from datetime import datetime
 import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
-# Load environment variables
 try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # Continue without dotenv if not available
-
-# Video processing libraries
-try:
-    import cv2
     import numpy as np
-    from moviepy.editor import *
-    from moviepy.video.fx import resize
+    import requests
     from PIL import Image, ImageDraw, ImageFont
 except ImportError as e:
     print(f"Missing required library: {e}")
-    print("Please install required packages: pip install opencv-python moviepy pillow numpy")
+    print("Please install required packages: pip install -r requirements.txt")
     sys.exit(1)
 
-# Audio processing libraries
-try:
-    import librosa
-    LIBROSA_AVAILABLE = True
-except ImportError:
-    LIBROSA_AVAILABLE = False
-    print("Warning: Librosa not available. Audio visualization will use basic analysis.")
-
-# Try to import whisper (optional for captions)
-try:
-    import whisper
-    WHISPER_AVAILABLE = True
-except ImportError:
-    WHISPER_AVAILABLE = False
-    print("Warning: Whisper not available. Videos will be created without captions.")
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+ROOT = Path(__file__).resolve().parent
+AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg", ".opus"}
+TEXT_FIELDS = ("label", "title", "subtitle", "date", "topic", "footer")
+
+# Portrait 9:16. The layout below is in these pixel coordinates.
+W, H = 1080, 1920
+SAMPLE_RATE = 16000  # whisper's rate; also plenty for the visualiser
+
+DEFAULT_CONFIG = {
+    "video": {"fps": 30, "crf": 18, "audio_bitrate": "192k"},
+    "background": {"top": [50, 100, 200], "bottom": [12, 38, 84]},
+    "logos": {},
+    "text": {field: "" for field in TEXT_FIELDS},
+    "fonts": {"regular": None, "bold": None},
+    "captions": {
+        "enabled": True,
+        "font_size": 76,
+        "color": [255, 255, 255],
+        "highlight_color": [150, 212, 255],
+        "max_chars": 26,
+        "y": 1290,
+        "corrections": {},
+    },
+    "audio_visualization": {
+        "enabled": True,
+        "y": 905,
+        "width": 900,
+        "height": 260,
+        "num_bars": 48,
+        "bar_width": 12,
+        "min_hz": 100,
+        "max_hz": 8000,
+        "center_color": [150, 220, 255],
+        "edge_color": [90, 170, 235],
+    },
+    "whisper": {"model": "medium.en", "language": "en", "initial_prompt": None},
+}
+
+FONT_CANDIDATES = {
+    "regular": [
+        Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "segoeui.ttf",
+        Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+        Path("/Library/Fonts/Arial.ttf"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    ],
+    "bold": [
+        Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "segoeuib.ttf",
+        Path("/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+        Path("/Library/Fonts/Arial Bold.ttf"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+    ],
+}
+
+
+def deep_merge(base: dict, override: dict) -> dict:
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_config(path: Path) -> dict:
+    config = DEFAULT_CONFIG
+    if path.exists():
+        config = deep_merge(config, json.loads(path.read_text(encoding="utf-8")))
+    else:
+        logger.warning(f"{path} not found - using built-in defaults")
+    return config
+
+
+def require_ffmpeg() -> None:
+    for tool in ("ffmpeg", "ffprobe"):
+        if not shutil.which(tool):
+            sys.exit(f"{tool} not found on PATH. Install FFmpeg (with libass) and try again.")
+
+
+def probe_duration(audio_path: Path) -> float:
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(audio_path)],
+        capture_output=True, encoding="utf-8", check=True)
+    return float(result.stdout.strip())
+
+
+def decode_audio(audio_path: Path) -> np.ndarray:
+    """Decode any ffmpeg-readable audio to mono float32 at SAMPLE_RATE."""
+    result = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(audio_path), "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "-"],
+        capture_output=True, check=True)
+    return np.frombuffer(result.stdout, dtype=np.float32)
+
+
+@functools.lru_cache(maxsize=1)
+def load_whisper(model_name: str):
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        sys.exit("faster-whisper is not installed: pip install -r requirements.txt")
+    logger.info(f"Loading Whisper model '{model_name}' (first use downloads it)...")
+    return WhisperModel(model_name, device="cpu", compute_type="int8")
+
+
+def apply_corrections(text: str, corrections: dict) -> str:
+    for wrong, right in corrections.items():
+        text = re.sub(rf"\b{re.escape(wrong)}\b", right, text)
+    return text
+
+
+def srt_timestamp(t: float) -> str:
+    ms = int(round(t * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def ass_timestamp(t: float) -> str:
+    cs = int(round(max(t, 0) * 100))
+    h, cs = divmod(cs, 360_000)
+    m, cs = divmod(cs, 6000)
+    s, cs = divmod(cs, 100)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def ass_colour(rgb) -> str:
+    r, g, b = rgb
+    return f"&H{b:02X}{g:02X}{r:02X}&"
+
+
+def find_font(kind: str, configured) -> Path:
+    candidates = [Path(configured)] if configured else FONT_CANDIDATES[kind]
+    for path in candidates:
+        if path.exists():
+            return path
+    sys.exit(f"No {kind} font found. Set fonts.{kind} in config.json to a .ttf file.")
+
+
 class MP3ToMP4Converter:
-    def __init__(self, input_folder: str = "input", output_folder: str = "output"):
+    def __init__(self, input_folder: str = "input", output_folder: str = "output",
+                 config_path: Path = ROOT / "config.json"):
         self.input_folder = Path(input_folder)
         self.output_folder = Path(output_folder)
-        
-        # Load configuration
-        self.config = self.load_config()
-        
-        # Create directories if they don't exist
         self.input_folder.mkdir(exist_ok=True)
         self.output_folder.mkdir(exist_ok=True)
-        
-        # Video settings from config
-        self.video_width = self.config["video_settings"]["width"]
-        self.video_height = self.config["video_settings"]["height"]
-        self.fps = self.config["video_settings"]["fps"]
-        
-        # Check if captions are enabled
-        self.enable_captions = os.getenv("ENABLE_CAPTIONS", "true").lower() == "true"
-        self.enable_logos = os.getenv("ENABLE_LOGOS", "true").lower() == "true"
-        
-        # Initialize Whisper model for transcription
-        if WHISPER_AVAILABLE and self.enable_captions:
-            try:
-                model_name = self.config["whisper"]["model"]
-                self.whisper_model = whisper.load_model(model_name)
-                logger.info(f"Whisper model '{model_name}' loaded successfully")
-            except Exception as e:
-                logger.warning(f"Could not load Whisper model: {e}")
-                self.whisper_model = None
-        else:
-            self.whisper_model = None
-            if not self.enable_captions:
-                logger.info("Captions disabled via environment variable")
-            else:
-                logger.info("Whisper not available - videos will be created without captions")
-    
-    def load_config(self) -> dict:
-        """Load configuration from config.json and environment variables"""
-        config_path = Path("config.json")
-        config = {}
-        
-        # Load from config.json if it exists
-        if config_path.exists():
-            try:
-                with open(config_path, 'r') as f:
-                    config = json.load(f)
-            except Exception as e:
-                logger.error(f"Failed to load config.json: {e}")
-        
-        # Override with environment variables
-        config = self._override_with_env(config)
-        
-        return config
-    
-    def _override_with_env(self, config: dict) -> dict:
-        """Override configuration with environment variables"""
-        # Video settings
-        if "video_settings" not in config:
-            config["video_settings"] = {}
-        
-        config["video_settings"]["width"] = int(os.getenv("VIDEO_WIDTH", config.get("video_settings", {}).get("width", 480)))
-        config["video_settings"]["height"] = int(os.getenv("VIDEO_HEIGHT", config.get("video_settings", {}).get("height", 854)))
-        config["video_settings"]["fps"] = int(os.getenv("VIDEO_FPS", config.get("video_settings", {}).get("fps", 30)))
-        
-        # Background colors
-        if "background" not in config:
-            config["background"] = {"type": "gradient", "colors": {}}
-        if "colors" not in config["background"]:
-            config["background"]["colors"] = {}
-        
-        # Check for transparent background setting
-        config["transparent_background"] = os.getenv("TRANSPARENT_BACKGROUND", "false").lower() == "true"
-        
-        config["background"]["colors"]["top"] = [
-            int(os.getenv("BG_TOP_RED", config.get("background", {}).get("colors", {}).get("top", [100, 50, 20])[0])),
-            int(os.getenv("BG_TOP_GREEN", config.get("background", {}).get("colors", {}).get("top", [100, 50, 20])[1])),
-            int(os.getenv("BG_TOP_BLUE", config.get("background", {}).get("colors", {}).get("top", [100, 50, 20])[2]))
-        ]
-        config["background"]["colors"]["bottom"] = [
-            int(os.getenv("BG_BOTTOM_RED", config.get("background", {}).get("colors", {}).get("bottom", [200, 100, 50])[0])),
-            int(os.getenv("BG_BOTTOM_GREEN", config.get("background", {}).get("colors", {}).get("bottom", [200, 100, 50])[1])),
-            int(os.getenv("BG_BOTTOM_BLUE", config.get("background", {}).get("colors", {}).get("bottom", [200, 100, 50])[2]))
-        ]
-        
-        # Logo URLs
-        if "logos" not in config:
-            config["logos"] = {}
-        if "rummerlab" not in config["logos"]:
-            config["logos"]["rummerlab"] = {}
-        if "physioshark" not in config["logos"]:
-            config["logos"]["physioshark"] = {}
-        
-        config["logos"]["rummerlab"]["url"] = os.getenv("RUMMERLAB_LOGO_URL", 
-            config.get("logos", {}).get("rummerlab", {}).get("url", "https://rummerlab.com/images/rummerlab_logo_transparent.png"))
-        config["logos"]["physioshark"]["url"] = os.getenv("PHYSIOSHARK_LOGO_URL", 
-            config.get("logos", {}).get("physioshark", {}).get("url", "https://physioshark.org/images/logo-physioshark-project.png"))
-        
-        # Caption settings
-        if "captions" not in config:
-            config["captions"] = {}
-        
-        config["captions"]["font_size"] = int(os.getenv("CAPTION_FONT_SIZE", config.get("captions", {}).get("font_size", 60)))
-        config["captions"]["font_color"] = os.getenv("CAPTION_FONT_COLOR", config.get("captions", {}).get("font_color", "white"))
-        config["captions"]["stroke_color"] = os.getenv("CAPTION_STROKE_COLOR", config.get("captions", {}).get("stroke_color", "black"))
-        config["captions"]["stroke_width"] = int(os.getenv("CAPTION_STROKE_WIDTH", config.get("captions", {}).get("stroke_width", 3)))
-        
-        # Whisper settings
-        if "whisper" not in config:
-            config["whisper"] = {}
-        
-        config["whisper"]["model"] = os.getenv("WHISPER_MODEL", config.get("whisper", {}).get("model", "base"))
-        config["whisper"]["language"] = os.getenv("WHISPER_LANGUAGE", config.get("whisper", {}).get("language"))
-        
-        # Set default values for missing keys
-        if "position" not in config["captions"]:
-            config["captions"]["position"] = "bottom"
-        if "max_width" not in config["captions"]:
-            config["captions"]["max_width"] = 980
-        if "words_per_segment" not in config["captions"]:
-            config["captions"]["words_per_segment"] = 5
-        
-        if "position" not in config["logos"]["rummerlab"]:
-            config["logos"]["rummerlab"]["position"] = "top-left"
-        if "max_height" not in config["logos"]["rummerlab"]:
-            config["logos"]["rummerlab"]["max_height"] = 200
-        if "margin" not in config["logos"]["rummerlab"]:
-            config["logos"]["rummerlab"]["margin"] = 50
-        
-        if "position" not in config["logos"]["physioshark"]:
-            config["logos"]["physioshark"]["position"] = "top-right"
-        if "max_height" not in config["logos"]["physioshark"]:
-            config["logos"]["physioshark"]["max_height"] = 200
-        if "margin" not in config["logos"]["physioshark"]:
-            config["logos"]["physioshark"]["margin"] = 50
-        
-        if "codec" not in config["video_settings"]:
-            config["video_settings"]["codec"] = "libx264"
-        if "audio_codec" not in config["video_settings"]:
-            config["video_settings"]["audio_codec"] = "aac"
-        
-        return config
-    
-    def download_logos(self) -> dict:
-        """Download logos from URLs and return paths to local files"""
-        if not self.enable_logos:
-            logger.info("Logos disabled via environment variable")
-            return {}
-        
-        logo_paths = {}
-        
-        for name, logo_config in self.config["logos"].items():
-            # Download logos to root directory instead of output folder
-            logo_path = Path(f"{name}_logo.png")
-            
-            if not logo_path.exists():
+
+        self.config = load_config(config_path)
+        self.fps = self.config["video"]["fps"]
+        self.font_regular = find_font("regular", self.config["fonts"]["regular"])
+        self.font_bold = find_font("bold", self.config["fonts"]["bold"])
+        self.cache_folder = ROOT / ".cache"
+
+    # ------------------------------------------------------------ inputs
+
+    def download_logos(self) -> list:
+        """Download logos (cached in .cache/) and return their local paths, in config order."""
+        self.cache_folder.mkdir(exist_ok=True)
+        paths = []
+        for name, logo in self.config["logos"].items():
+            path = self.cache_folder / f"{name}_logo.png"
+            if not path.exists():
                 try:
                     logger.info(f"Downloading {name} logo...")
-                    response = requests.get(logo_config["url"], timeout=30)
+                    response = requests.get(logo["url"], timeout=30)
                     response.raise_for_status()
-                    
-                    with open(logo_path, 'wb') as f:
-                        f.write(response.content)
-                    
-                    logger.info(f"Downloaded {name} logo successfully to {logo_path}")
+                    path.write_bytes(response.content)
                 except Exception as e:
                     logger.error(f"Failed to download {name} logo: {e}")
                     continue
-            
-            logo_paths[name] = logo_path
-        
-        return logo_paths
-    
-    def transcribe_audio(self, audio_path: Path) -> str:
-        """Transcribe audio using Whisper (local or API)"""
-        if not self.enable_captions:
-            logger.info("Captions disabled, skipping transcription")
-            return ""
-        
-        # Check for OpenAI API key first
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        whisper_api_key = os.getenv("WHISPER_API_KEY")
-        
-        if openai_api_key or whisper_api_key:
-            return self._transcribe_with_api(audio_path, openai_api_key or whisper_api_key)
-        
-        # Fall back to local Whisper model
-        if not self.whisper_model:
-            logger.warning("Whisper model not available, skipping transcription")
-            return ""
-        
-        try:
-            logger.info(f"Transcribing {audio_path.name} with local Whisper...")
-            # Use language from config if specified
-            language = self.config["whisper"]["language"]
-            result = self.whisper_model.transcribe(str(audio_path), language=language)
-            return result["text"]
-        except Exception as e:
-            logger.error(f"Local transcription failed: {e}")
-            return ""
-    
-    def _transcribe_with_api(self, audio_path: Path, api_key: str) -> str:
-        """Transcribe audio using OpenAI API"""
-        try:
-            logger.info(f"Transcribing {audio_path.name} with OpenAI API...")
-            
-            # Prepare the API request
-            api_url = os.getenv("WHISPER_API_URL", "https://api.openai.com/v1/audio/transcriptions")
-            
-            headers = {
-                "Authorization": f"Bearer {api_key}"
-            }
-            
-            with open(audio_path, "rb") as audio_file:
-                files = {
-                    "file": (audio_path.name, audio_file, "audio/mpeg"),
-                    "model": (None, "whisper-1"),
-                    "language": (None, self.config["whisper"]["language"] or "en")
-                }
-                
-                response = requests.post(api_url, headers=headers, files=files, timeout=60)
-                response.raise_for_status()
-                
-                result = response.json()
-                return result.get("text", "")
-                
-        except Exception as e:
-            logger.error(f"API transcription failed: {e}")
-            return ""
-    
-    def create_captions(self, text: str, duration: float) -> List[dict]:
-        """Create caption segments from transcribed text"""
-        if not text:
-            return []
-        
-        # Simple word-based segmentation
-        words = text.split()
-        words_per_segment = self.config["captions"]["words_per_segment"]
-        segments = []
-        
-        for i in range(0, len(words), words_per_segment):
-            segment_words = words[i:i + words_per_segment]
-            segment_text = " ".join(segment_words)
-            
-            start_time = (i / len(words)) * duration
-            end_time = min(((i + words_per_segment) / len(words)) * duration, duration)
-            
-            segments.append({
-                "text": segment_text,
-                "start": start_time,
-                "end": end_time
-            })
-        
-        return segments
-    
-    def create_caption_clip(self, text: str, start_time: float, end_time: float) -> TextClip:
-        """Create a text clip for captions"""
-        try:
-            caption_config = self.config["captions"]
-            
-            # Create caption with styling from config
-            txt_clip = TextClip(
-                text,
-                fontsize=caption_config["font_size"],
-                color=caption_config["font_color"],
-                font='Arial-Bold',
-                stroke_color=caption_config["stroke_color"],
-                stroke_width=caption_config["stroke_width"],
-                method='caption',
-                size=(caption_config["max_width"], None)
-            ).set_position(('center', caption_config["position"])).set_duration(end_time - start_time).set_start(start_time)
-            
-            return txt_clip
-        except Exception as e:
-            logger.error(f"Failed to create caption clip: {e}")
-            return None
-    
-    def create_audio_visualization(self, audio: AudioFileClip, duration: float) -> VideoClip:
-        """Create advanced audio visualization using STFT frequency analysis"""
-        viz_config = self.config.get("audio_visualization", {})
-        
-        if not viz_config.get("enabled", True):
-            return None
-        
-        # Parameters from config
-        num_bars = viz_config.get("num_bars", 60)
-        bar_width = viz_config.get("bar_width", 6)
-        bar_spacing = viz_config.get("bar_spacing", 3)
-        bar_color = viz_config.get("bar_color", [100, 200, 255])
-        bar_alpha = viz_config.get("bar_alpha", 0.8)
-        viz_height = viz_config.get("height", 120)
-        sensitivity = viz_config.get("sensitivity", 2.0)
-        
-        # Enhanced visualization features
-        gradient_enabled = viz_config.get("gradient", {}).get("enabled", True)
-        glow_enabled = viz_config.get("glow", {}).get("enabled", True)
-        background_enabled = viz_config.get("background", {}).get("enabled", True)
-        
-        # Background settings
-        bg_height = viz_config.get("background", {}).get("height", 140)
-        bg_color = viz_config.get("background", {}).get("color", [0, 0, 0, 150])
-        bg_blur = viz_config.get("background", {}).get("blur", 10)
-        
-        # Advanced audio analysis using STFT
-        frequency_data = None
-        time_data = None
-        spectrogram = None
-        
-        if LIBROSA_AVAILABLE:
-            try:
-                # Save audio to temporary file for librosa processing
-                temp_audio_path = "temp_audio_for_analysis.wav"
-                audio.write_audiofile(temp_audio_path, verbose=False, logger=None)
-                
-                # Load audio with librosa
-                y, sr = librosa.load(temp_audio_path, sr=None)
-                
-                # Advanced STFT analysis (as described in the article)
-                hop_length = 512
-                n_fft = 2048 * 4  # 4x larger for better accuracy
-                
-                # Get STFT matrix (frequency vs time)
-                stft = np.abs(librosa.stft(y, hop_length=hop_length, n_fft=n_fft))
-                
-                # Convert to decibel scale
-                spectrogram = librosa.amplitude_to_db(stft, ref=np.max)
-                
-                # Get frequency and time arrays
-                frequencies = librosa.core.fft_frequencies(n_fft=n_fft)
-                times = librosa.core.frames_to_time(np.arange(spectrogram.shape[1]), sr=sr, hop_length=hop_length, n_fft=n_fft)
-                
-                # Calculate ratios for index mapping
-                time_index_ratio = len(times) / times[-1] if len(times) > 0 else 1
-                frequencies_index_ratio = len(frequencies) / frequencies[-1] if len(frequencies) > 0 else 1
-                
-                # Store for later use
-                frequency_data = {
-                    'frequencies': frequencies,
-                    'frequencies_index_ratio': frequencies_index_ratio
-                }
-                time_data = {
-                    'times': times,
-                    'time_index_ratio': time_index_ratio
-                }
-                
-                # Clean up temporary file
-                if os.path.exists(temp_audio_path):
-                    os.remove(temp_audio_path)
-                
-                logger.info("Successfully analyzed audio with advanced STFT")
-                
-            except Exception as e:
-                logger.warning(f"Could not analyze audio with STFT: {e}")
-                frequency_data = None
-                time_data = None
-                spectrogram = None
-        
-        # Fallback to basic analysis if STFT fails
-        if spectrogram is None:
-            try:
-                # Extract audio array at 44100 Hz for analysis
-                audio_array = audio.to_soundarray(fps=44100)
-                
-                # Handle stereo to mono conversion
-                if len(audio_array.shape) > 1:
-                    audio_array = np.mean(audio_array, axis=1)
-                
-                audio_array = np.asarray(audio_array).flatten()
-                
-                # Calculate audio levels for each time segment
-                samples_per_frame = int(44100 / self.fps)
-                num_frames = int(duration * self.fps)
-                
-                audio_levels = []
-                for frame_idx in range(num_frames):
-                    start_sample = frame_idx * samples_per_frame
-                    end_sample = min(start_sample + samples_per_frame, len(audio_array))
-                    
-                    if end_sample > start_sample:
-                        frame_audio = audio_array[start_sample:end_sample]
-                        rms = np.sqrt(np.mean(frame_audio**2))
-                        audio_levels.append(rms)
-                    else:
-                        audio_levels.append(0.0)
-                
-                # Normalize audio levels
-                max_level = max(audio_levels) if audio_levels else 1.0
-                if max_level > 0:
-                    audio_levels = [level / max_level for level in audio_levels]
-                
-            except Exception as e:
-                logger.warning(f"Could not analyze audio for visualization: {e}")
-                audio_levels = None
-        
-        # Calculate total width needed for bars
-        total_bar_width = num_bars * (bar_width + bar_spacing) - bar_spacing
-        start_x = (self.video_width - total_bar_width) // 2
-        
-        def get_decibel(target_time, freq):
-            """Get decibel value for specific time and frequency (from article)"""
-            if spectrogram is not None and frequency_data and time_data:
-                try:
-                    freq_idx = int(freq * frequency_data['frequencies_index_ratio'])
-                    time_idx = int(target_time * time_data['time_index_ratio'])
-                    
-                    # Ensure indices are within bounds
-                    freq_idx = max(0, min(freq_idx, spectrogram.shape[0] - 1))
-                    time_idx = max(0, min(time_idx, spectrogram.shape[1] - 1))
-                    
-                    return spectrogram[freq_idx][time_idx]
-                except:
-                    return -80  # Default low value
-            return -80
-        
-        def make_viz_frame(t):
-            # Create frame with background if enabled
-            if background_enabled:
-                # Create larger frame to accommodate background
-                frame = np.zeros((bg_height, self.video_width, 3), dtype=np.uint8)
-                
-                # Create background bar
-                bg_y_start = bg_height - viz_height - 20
-                bg_y_end = bg_height - 10
-                
-                # Draw semi-transparent background
-                for y in range(bg_y_start, bg_y_end):
-                    for x in range(self.video_width):
-                        # Create gradient background
-                        bg_ratio = (y - bg_y_start) / (bg_y_end - bg_y_start)
-                        bg_r = int(bg_color[0] * bg_ratio)
-                        bg_g = int(bg_color[1] * bg_ratio)
-                        bg_b = int(bg_color[2] * bg_ratio)
-                        frame[y, x] = [bg_b, bg_g, bg_r]  # BGR order
-                
-                # Set visualization area
-                viz_y_offset = bg_y_start
-            else:
-                frame = np.zeros((viz_height, self.video_width, 3), dtype=np.uint8)
-                viz_y_offset = 0
-            
-            # Create frequency-based bars
-            for i in range(num_bars):
-                # Map bar index to frequency range (100Hz to 8000Hz)
-                freq = 100 + (i / num_bars) * 7900
-                
-                # Get decibel value for this frequency and time
-                decibel = get_decibel(t, freq)
-                
-                # Convert decibel to height
-                min_decibel = -80
-                max_decibel = 0
-                min_height = 3
-                max_height = viz_height * 0.9
-                
-                # Calculate height based on decibel
-                if decibel > min_decibel:
-                    decibel_height_ratio = (max_height - min_height) / (max_decibel - min_decibel)
-                    desired_height = decibel * decibel_height_ratio + max_height
-                    wave_height = int(max(min_height, min(max_height, desired_height)))
-                else:
-                    wave_height = min_height
-                
-                # Apply sensitivity
-                wave_height = int(wave_height * sensitivity)
-                
-                if wave_height > 0:
-                    x = start_x + i * (bar_width + bar_spacing)
-                    
-                    # Draw bar with enhanced effects
-                    for y in range(max(0, wave_height)):
-                        for x_offset in range(bar_width):
-                            if x + x_offset < self.video_width and y < viz_height:
-                                # Create gradient effect - brighter at the top
-                                gradient_factor = 1.0 - (y / max(wave_height, 1))
-                                
-                                # Enhanced color calculation
-                                if gradient_enabled:
-                                    top_color = viz_config.get("gradient", {}).get("top_color", [150, 220, 255])
-                                    bottom_color = viz_config.get("gradient", {}).get("bottom_color", [80, 160, 220])
-                                    
-                                    # Interpolate between top and bottom colors
-                                    r = int(top_color[0] + gradient_factor * (bottom_color[0] - top_color[0]))
-                                    g = int(top_color[1] + gradient_factor * (bottom_color[1] - top_color[1]))
-                                    b = int(top_color[2] + gradient_factor * (bottom_color[2] - top_color[2]))
-                                else:
-                                    # Use single color with intensity variation
-                                    color_intensity = bar_alpha * (0.6 + 0.4 * gradient_factor)
-                                    r = int(bar_color[0] * color_intensity)
-                                    g = int(bar_color[1] * color_intensity)
-                                    b = int(bar_color[2] * color_intensity)
-                                
-                                # Add glow effect
-                                if glow_enabled:
-                                    glow_intensity = viz_config.get("glow", {}).get("intensity", 0.3)
-                                    glow_color = viz_config.get("glow", {}).get("color", [100, 200, 255])
-                                    
-                                    # Add glow around the bar
-                                    glow_factor = max(0, 1.0 - (y / max(wave_height, 1))) * glow_intensity
-                                    r = min(255, r + int(glow_color[0] * glow_factor))
-                                    g = min(255, g + int(glow_color[1] * glow_factor))
-                                    b = min(255, b + int(glow_color[2] * glow_factor))
-                                
-                                # Add frequency-based color variation
-                                freq_factor = i / num_bars
-                                r = min(255, r + int(20 * freq_factor))
-                                b = min(255, b + int(20 * (1 - freq_factor)))
-                                
-                                # Clamp values
-                                r = max(0, min(255, r))
-                                g = max(0, min(255, g))
-                                b = max(0, min(255, b))
-                                
-                                # Set pixel
-                                frame[viz_y_offset + viz_height - 1 - y, x + x_offset] = [b, g, r]  # BGR order
-                                
-                                # Add subtle glow effect to surrounding pixels
-                                if glow_enabled and y < wave_height * 0.3:  # Only for top portion
-                                    for dx in [-1, 1]:
-                                        for dy in [-1, 1]:
-                                            glow_x = x + x_offset + dx
-                                            glow_y = viz_y_offset + viz_height - 1 - y + dy
-                                            if (0 <= glow_x < self.video_width and 
-                                                0 <= glow_y < frame.shape[0]):
-                                                # Blend with existing pixel
-                                                existing = frame[glow_y, glow_x]
-                                                glow_blend = 0.3
-                                                frame[glow_y, glow_x] = [
-                                                    int(existing[0] * (1 - glow_blend) + b * glow_blend),
-                                                    int(existing[1] * (1 - glow_blend) + g * glow_blend),
-                                                    int(existing[2] * (1 - glow_blend) + r * glow_blend)
-                                                ]
-            
-            return frame
-        
-        viz_clip = VideoClip(make_viz_frame, duration=duration)
-        return viz_clip
-    
-    def create_background_video(self, duration: float) -> VideoClip:
-        """Create a background video with enhanced gradient and subtle effects"""
-        bg_config = self.config["background"]
-        
-        # Check if we want transparent background
-        transparent_bg = self.config.get("transparent_background", False)
-        
-        if transparent_bg:
-            # Create transparent background
-            def make_frame(t):
-                # Create a transparent frame (RGBA with alpha=0)
-                frame = np.zeros((self.video_height, self.video_width, 4), dtype=np.uint8)
-                frame[:, :, 3] = 0  # Set alpha to 0 (transparent)
-                return frame
-            
-            background = VideoClip(make_frame, duration=duration)
-        else:
-            # Create enhanced gradient background with subtle effects
-            def make_frame(t):
-                # Create a gradient from top to bottom
-                frame = np.zeros((self.video_height, self.video_width, 3), dtype=np.uint8)
-                
-                # Use colors from config
-                top_color = bg_config["colors"]["top"]
-                bottom_color = bg_config["colors"]["bottom"]
-                
-                # Add subtle animation to the gradient
-                time_factor = np.sin(t * 0.5) * 0.05  # Subtle breathing effect
-                
-                for y in range(self.video_height):
-                    ratio = y / self.video_height
-                    
-                    # Add subtle horizontal variation
-                    x_factor = np.sin(y * 0.01 + t * 0.3) * 0.02
-                    
-                    # Interpolate between top and bottom colors with subtle variations
-                    red = int(top_color[0] + ratio * (bottom_color[0] - top_color[0]) + time_factor * 10 + x_factor * 5)
-                    green = int(top_color[1] + ratio * (bottom_color[1] - top_color[1]) + time_factor * 8 + x_factor * 3)
-                    blue = int(top_color[2] + ratio * (bottom_color[2] - top_color[2]) + time_factor * 12 + x_factor * 4)
-                    
-                    # Clamp values to valid range
-                    red = max(0, min(255, red))
-                    green = max(0, min(255, green))
-                    blue = max(0, min(255, blue))
-                    
-                    frame[y, :] = [blue, green, red]  # OpenCV uses BGR order
-                
-                # Add subtle overlay pattern if enabled
-                if bg_config.get("overlay", {}).get("enabled", False):
-                    overlay_opacity = bg_config["overlay"].get("opacity", 0.1)
-                    pattern_type = bg_config["overlay"].get("type", "subtle_pattern")
-                    
-                    if pattern_type == "subtle_pattern":
-                        # Create subtle diagonal lines
-                        for y in range(0, self.video_height, 20):
-                            for x in range(0, self.video_width, 20):
-                                if (x + y) % 40 == 0:
-                                    # Add subtle diagonal pattern
-                                    for i in range(10):
-                                        px = x + i
-                                        py = y + i
-                                        if px < self.video_width and py < self.video_height:
-                                            # Add subtle brightness variation
-                                            frame[py, px] = [
-                                                min(255, frame[py, px, 0] + int(overlay_opacity * 20)),
-                                                min(255, frame[py, px, 1] + int(overlay_opacity * 20)),
-                                                min(255, frame[py, px, 2] + int(overlay_opacity * 20))
-                                            ]
-                
-                return frame
-            
-            background = VideoClip(make_frame, duration=duration)
-        
-        return background
-    
-    def add_logos_to_video(self, video: VideoClip, logo_paths: dict) -> VideoClip:
-        """Add logos to the video with enhanced styling"""
-        if not logo_paths:
-            return video
-        
-        logo_clips = []
-        
-        for name, logo_path in logo_paths.items():
-            if logo_path.exists():
-                try:
-                    logo_config = self.config["logos"][name]
-                    
-                    # Load and resize logo
-                    logo_img = Image.open(logo_path)
-                    
-                    # Resize logo based on config with auto-scaling
-                    max_height = logo_config["max_height"]
-                    max_width = logo_config.get("max_width", self.video_width * 0.4)
-                    
-                    # Calculate aspect ratio
-                    aspect_ratio = logo_img.width / logo_img.height
-                    
-                    # Scale based on height first
-                    new_height = min(max_height, logo_img.height)
-                    new_width = int(new_height * aspect_ratio)
-                    
-                    # If width exceeds max_width, scale down proportionally
-                    if new_width > max_width:
-                        new_width = int(max_width)
-                        new_height = int(new_width / aspect_ratio)
-                    
-                    logo_img = logo_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                    
-                    # Add shadow effect if enabled
-                    shadow_config = logo_config.get("shadow", {})
-                    if shadow_config.get("enabled", False):
-                        # Create shadow image
-                        shadow_offset = shadow_config.get("offset", 2)
-                        shadow_blur = shadow_config.get("blur", 4)
-                        shadow_color = shadow_config.get("color", [0, 0, 0, 100])
-                        
-                        # Create shadow by duplicating the logo with shadow color
-                        shadow_img = logo_img.copy()
-                        
-                        # Apply shadow color to non-transparent pixels
-                        if shadow_img.mode == 'RGBA':
-                            data = np.array(shadow_img)
-                            # Create shadow effect for non-transparent pixels
-                            alpha_mask = data[:, :, 3] > 0
-                            data[alpha_mask, 0] = shadow_color[0]  # R
-                            data[alpha_mask, 1] = shadow_color[1]  # G
-                            data[alpha_mask, 2] = shadow_color[2]  # B
-                            data[alpha_mask, 3] = shadow_color[3]  # A
-                            shadow_img = Image.fromarray(data)
-                        
-                        # Create shadow clip
-                        shadow_array = np.array(shadow_img)
-                        shadow_clip = ImageClip(shadow_array).set_duration(video.duration)
-                        
-                        # Position shadow slightly offset
-                        position = logo_config["position"]
-                        margin = logo_config["margin"]
-                        
-                        if "left" in position:
-                            x = margin + shadow_offset
-                        elif "right" in position:
-                            x = self.video_width - new_width - margin + shadow_offset
-                        elif "center" in position:
-                            x = (self.video_width - new_width) // 2 + shadow_offset
-                        else:
-                            x = (self.video_width - new_width) // 2 + shadow_offset
-                        
-                        if "top" in position:
-                            y = margin + shadow_offset
-                        elif "bottom" in position:
-                            y = self.video_height - new_height - margin + shadow_offset
-                        elif "center" in position and "top" not in position and "bottom" not in position:
-                            y = (self.video_height - new_height) // 2 + shadow_offset
-                        else:
-                            y = (self.video_height - new_height) // 2 + shadow_offset
-                        
-                        shadow_clip = shadow_clip.set_position((x, y))
-                        logo_clips.append(shadow_clip)
-                    
-                    # Convert to numpy array
-                    logo_array = np.array(logo_img)
-                    
-                    # Handle transparency - keep RGBA for transparency
-                    if logo_array.shape[2] == 4:  # RGBA
-                        # Keep the RGBA format for transparency
-                        pass
-                    else:
-                        # Convert RGB to RGBA if needed
-                        rgba_array = np.zeros((new_height, new_width, 4), dtype=np.uint8)
-                        rgba_array[:, :, :3] = logo_array
-                        rgba_array[:, :, 3] = 255  # Full alpha
-                        logo_array = rgba_array
-                    
-                    # Create video clip from logo
-                    logo_clip = ImageClip(logo_array).set_duration(video.duration)
-                    
-                    # Position logo based on config
-                    position = logo_config["position"]
-                    margin = logo_config["margin"]
-                    
-                    if "left" in position:
-                        x = margin
-                    elif "right" in position:
-                        x = self.video_width - new_width - margin
-                    elif "center" in position:
-                        x = (self.video_width - new_width) // 2
-                    else:  # center
-                        x = (self.video_width - new_width) // 2
-                    
-                    if "top" in position:
-                        y = margin
-                    elif "bottom" in position:
-                        y = self.video_height - new_height - margin
-                    elif "center" in position and "top" not in position and "bottom" not in position:
-                        y = (self.video_height - new_height) // 2
-                    else:  # center
-                        y = (self.video_height - new_height) // 2
-                    
-                    logo_clip = logo_clip.set_position((x, y))
-                    logo_clips.append(logo_clip)
-                    
-                except Exception as e:
-                    logger.error(f"Failed to add logo {name}: {e}")
-        
-        # Composite all clips
-        if logo_clips:
-            final_video = CompositeVideoClip([video] + logo_clips)
-            return final_video
-        
-        return video
-    
-    def convert_mp3_to_mp4(self, mp3_path: Path, force: bool = False) -> bool:
-        """Convert a single MP3 file to MP4"""
-        # Generate output filename
-        output_filename = mp3_path.stem + ".mp4"
-        output_path = self.output_folder / output_filename
-        
-        # Check if output already exists
+            paths.append(path)
+        return paths
+
+    def card_text(self, audio_path: Path, meta_path, overrides: dict) -> dict:
+        """Title-card text: config.json defaults < <audio>.json sidecar (or --meta) < CLI flags."""
+        text = dict(self.config["text"])
+        meta_path = Path(meta_path) if meta_path else audio_path.with_suffix(".json")
+        if meta_path.exists():
+            logger.info(f"Using title-card text from {meta_path}")
+            text.update(json.loads(meta_path.read_text(encoding="utf-8")))
+        text.update({k: v for k, v in overrides.items() if v is not None})
+        return text
+
+    def transcribe(self, audio_path: Path, pcm: np.ndarray, retranscribe: bool) -> list:
+        """Word-timed transcript, cached as output/<name>.transcript.json."""
+        cache = self.output_folder / f"{audio_path.stem}.transcript.json"
+        if cache.exists() and not retranscribe:
+            logger.info(f"Using cached transcript {cache.name} (pass --retranscribe to redo it)")
+            return json.loads(cache.read_text(encoding="utf-8"))["segments"]
+
+        whisper_cfg = self.config["whisper"]
+        model = load_whisper(whisper_cfg["model"])
+        logger.info(f"Transcribing {audio_path.name}...")
+        segments, _ = model.transcribe(
+            pcm, language=whisper_cfg["language"], initial_prompt=whisper_cfg["initial_prompt"],
+            word_timestamps=True, vad_filter=True, beam_size=5)
+        result = [{
+            "start": s.start, "end": s.end, "text": s.text.strip(),
+            "words": [{"start": w.start, "end": w.end, "word": w.word} for w in (s.words or [])],
+        } for s in segments]
+
+        with open(cache, "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"model": whisper_cfg["model"], "segments": result}, f, indent=2, ensure_ascii=False)
+        return result
+
+    def caption_words(self, segments: list) -> list:
+        """Flatten the transcript into corrected, timed words."""
+        corrections = self.config["captions"]["corrections"]
+        words = []
+        for s in segments:
+            for i, w in enumerate(s["words"]):
+                token = apply_corrections(w["word"].strip(), corrections)
+                seg_end = i == len(s["words"]) - 1
+                if token.startswith("-") and words:  # "long" + "-term" -> "long-term"
+                    words[-1].update(t=words[-1]["t"] + token, end=w["end"], seg_end=seg_end)
+                    continue
+                words.append({"t": token, "start": w["start"], "end": w["end"], "seg_end": seg_end})
+        return words
+
+    @staticmethod
+    def chunk_words(words: list, max_chars: int, break_after: str, min_words: int = 3) -> list:
+        """Group words into lines, breaking after punctuation, at segment ends, or once long enough."""
+        chunks, current = [], []
+        for w in words:
+            current.append(w)
+            line = " ".join(x["t"] for x in current)
+            if ((w["t"] and w["t"][-1] in break_after and len(current) >= min_words) or w["seg_end"]
+                    or len(line) >= max_chars):
+                chunks.append(current)
+                current = []
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def write_transcripts(self, segments: list, stem: str) -> None:
+        """SRT for YouTube's subtitle upload, plain text for the video description."""
+        words = self.caption_words(segments)
+        with open(self.output_folder / f"{stem}.srt", "w", encoding="utf-8", newline="\n") as f:
+            for i, cue in enumerate(self.chunk_words(words, max_chars=70, break_after=".?!", min_words=1), 1):
+                text = " ".join(w["t"] for w in cue)
+                if len(text) > 42:  # two balanced lines read better than one long one
+                    middle = len(text) // 2
+                    split = min((m.start() for m in re.finditer(" ", text)), key=lambda p: abs(p - middle))
+                    text = text[:split] + "\n" + text[split + 1:]
+                f.write(f"{i}\n{srt_timestamp(cue[0]['start'])} --> {srt_timestamp(cue[-1]['end'])}\n{text}\n\n")
+        with open(self.output_folder / f"{stem}.txt", "w", encoding="utf-8", newline="\n") as f:
+            f.write(" ".join(w["t"] for w in words) + "\n")
+
+    # ------------------------------------------------------------ rendering
+
+    def build_background(self, text: dict, logo_paths: list) -> Image.Image:
+        bg_cfg = self.config["background"]
+        ramp = np.linspace(0, 1, H)[:, None]
+        top, bottom = np.array(bg_cfg["top"]), np.array(bg_cfg["bottom"])
+        gradient = (top + (bottom - top) * ramp).astype(np.uint8)
+        image = Image.fromarray(np.broadcast_to(gradient[:, None, :], (H, W, 3)).copy()).convert("RGBA")
+        draw = ImageDraw.Draw(image)
+
+        # Logos sit on a white card - their black/navy artwork disappears on the gradient.
+        if logo_paths:
+            cx0, cy0, cx1, cy1 = 60, 110, W - 60, 370
+            draw.rounded_rectangle((cx0, cy0, cx1, cy1), radius=36, fill=(255, 255, 255, 255))
+            slot_w = (cx1 - cx0 - 80) / len(logo_paths)
+            for i, path in enumerate(logo_paths):
+                x0 = cx0 + 40 + i * slot_w
+                if i:
+                    draw.line((x0, cy0 + 40, x0, cy1 - 40), fill=(210, 220, 230), width=3)
+                logo = Image.open(path).convert("RGBA")
+                box_w, box_h = slot_w - 20, cy1 - cy0 - 60
+                scale = min(box_w / logo.width, box_h / logo.height)
+                logo = logo.resize((int(logo.width * scale), int(logo.height * scale)), Image.LANCZOS)
+                image.alpha_composite(logo, (int(x0 + (slot_w - logo.width) / 2),
+                                             int(cy0 + (cy1 - cy0 - logo.height) / 2)))
+
+        def fitted(path: Path, size: int, content: str, max_w: int) -> ImageFont.FreeTypeFont:
+            font = ImageFont.truetype(str(path), size)
+            while draw.textlength(content, font=font) > max_w and size > 20:
+                size -= 2
+                font = ImageFont.truetype(str(path), size)
+            return font
+
+        def centered(content: str, y: int, font: ImageFont.FreeTypeFont, fill) -> None:
+            draw.text(((W - draw.textlength(content, font=font)) / 2, y), content, font=font, fill=fill)
+
+        y = 455
+        if text["label"]:
+            centered(text["label"].upper(), y, fitted(self.font_bold, 46, text["label"].upper(), 960),
+                     (150, 220, 255))
+            y += 65
+        if text["title"]:
+            centered(text["title"], y, fitted(self.font_bold, 92, text["title"], 960), (255, 255, 255))
+            y += 130
+        for field in ("subtitle", "date"):
+            if text[field]:
+                centered(text[field], y, fitted(self.font_regular, 44, text[field], 960), (220, 235, 250))
+                y += 62
+        if text["topic"]:
+            y += 26
+            font = fitted(self.font_bold, 42, text["topic"], 880)
+            text_w = draw.textlength(text["topic"], font=font)
+            pill = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            ImageDraw.Draw(pill).rounded_rectangle(
+                ((W - text_w) / 2 - 36, y, (W + text_w) / 2 + 36, y + 72), radius=36,
+                fill=(255, 255, 255, 38), outline=(150, 220, 255, 160), width=2)
+            image.alpha_composite(pill)
+            centered(text["topic"], y + 8, font, (255, 255, 255))
+        if text["footer"]:
+            centered(text["footer"], 1500, fitted(self.font_bold, 40, text["footer"], 960), (190, 225, 250))
+        return image.convert("RGB")
+
+    def build_captions(self, segments: list, font_family: str) -> str:
+        """ASS subtitles: short lines, with the word being spoken highlighted."""
+        cap = self.config["captions"]
+        words = self.caption_words(segments)
+        for w in words:  # braces and backslashes are ASS override syntax
+            w["t"] = w["t"].replace("{", "(").replace("}", ")").replace("\\", "/")
+        chunks = self.chunk_words(words, max_chars=cap["max_chars"], break_after=".?!,;")
+
+        highlight, normal = f"{{\\c{ass_colour(cap['highlight_color'])}}}", f"{{\\c{ass_colour(cap['color'])}}}"
+        position = f"{{\\pos({W // 2},{cap['y']})}}"
+        events = []
+        for ci, chunk in enumerate(chunks):
+            next_start = chunks[ci + 1][0]["start"] if ci + 1 < len(chunks) else chunk[-1]["end"] + 0.8
+            chunk_end = min(next_start, chunk[-1]["end"] + 0.8)
+            for wi in range(len(chunk)):
+                start = chunk[wi]["start"] if wi else chunk[0]["start"]
+                end = chunk[wi + 1]["start"] if wi + 1 < len(chunk) else chunk_end
+                line = " ".join(highlight + x["t"] + normal if j == wi else x["t"] for j, x in enumerate(chunk))
+                events.append(f"Dialogue: 0,{ass_timestamp(start)},{ass_timestamp(end)},Cap,,0,0,0,,"
+                              f"{position}{line}")
+
+        primary = "&H00" + ass_colour(cap["color"])[2:-1]  # styles take &HAABBGGRR
+        return "\n".join([
+            "[Script Info]",
+            "ScriptType: v4.00+",
+            f"PlayResX: {W}",
+            f"PlayResY: {H}",
+            "WrapStyle: 0",
+            "ScaledBorderAndShadow: yes",
+            "",
+            "[V4+ Styles]",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+            "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+            "Alignment, MarginL, MarginR, MarginV, Encoding",
+            f"Style: Cap,{font_family},{cap['font_size']},{primary},{primary},&H00301A08,&H96000000,"
+            "-1,0,0,0,100,100,0,0,1,5,3,5,110,110,0,1",
+            "",
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+            *events,
+            "",
+        ])
+
+    def visualizer_frames(self, pcm: np.ndarray, n_frames: int):
+        """Mirrored frequency bars (low frequencies in the middle), as raw RGBA frames."""
+        viz = self.config["audio_visualization"]
+        viz_w, viz_h, n_bars, bar_w = viz["width"], viz["height"], viz["num_bars"], viz["bar_width"]
+
+        n_fft = 2048
+        padded = np.concatenate([np.zeros(n_fft // 2, np.float32), pcm, np.zeros(n_fft, np.float32)])
+        starts = (np.arange(n_frames) * SAMPLE_RATE / self.fps).astype(int)
+        windows = np.stack([padded[s:s + n_fft] for s in starts]) * np.hanning(n_fft).astype(np.float32)
+        magnitude = np.abs(np.fft.rfft(windows, axis=1))
+        freqs = np.fft.rfftfreq(n_fft, 1 / SAMPLE_RATE)
+        edges = np.geomspace(viz["min_hz"], viz["max_hz"], n_bars + 1)
+        bands = np.stack([magnitude[:, (freqs >= lo) & (freqs < hi)].mean(axis=1)
+                          for lo, hi in zip(edges[:-1], edges[1:])], axis=1)
+        db = 20 * np.log10(bands + 1e-9)
+        level = np.clip((db - (np.percentile(db, 99.5) - 50)) / 50, 0, 1) ** 1.5
+
+        smooth = np.zeros_like(level)  # fast attack, slow release
+        for t in range(n_frames):
+            prev = smooth[t - 1] if t else 0
+            smooth[t] = np.where(level[t] > prev, 0.6 * level[t] + 0.4 * prev, 0.82 * prev + 0.18 * level[t])
+        heights = np.concatenate([smooth[:, ::-1], smooth], axis=1)
+
+        n_cols = heights.shape[1]
+        gap = (viz_w - n_cols * bar_w) / (n_cols - 1)
+        xs = np.arange(viz_w)
+        column = np.floor(xs / (bar_w + gap)).astype(int).clip(0, n_cols - 1)
+        in_bar = (xs - column * (bar_w + gap)) < bar_w
+        dist = np.abs(np.arange(viz_h) - (viz_h - 1) / 2)[:, None]
+        mix = np.clip(1 - dist / (viz_h / 2), 0, 1)[..., None]
+        center, edge = np.array(viz["center_color"]), np.array(viz["edge_color"])
+        rgb = np.broadcast_to((edge + (center - edge) * mix).astype(np.uint8), (viz_h, viz_w, 3))
+
+        for t in range(n_frames):
+            half = 4 + heights[t][column] * (viz_h / 2 - 6)
+            frame = np.zeros((viz_h, viz_w, 4), np.uint8)
+            frame[..., :3] = rgb
+            frame[..., 3] = ((dist <= half[None, :]) & in_bar[None, :]) * 235
+            yield frame.tobytes()
+
+    # ------------------------------------------------------------ pipeline
+
+    def convert(self, audio_path: Path, force: bool = False, retranscribe: bool = False,
+                meta_path=None, text_overrides: dict = None) -> bool:
+        output_path = self.output_folder / f"{audio_path.stem}.mp4"
         if output_path.exists() and not force:
-            logger.info(f"Skipping {mp3_path.name} - output already exists")
+            logger.info(f"Skipping {audio_path.name} - {output_path.name} already exists (use -f to redo)")
             return True
-        
+
         try:
-            logger.info(f"Converting {mp3_path.name} to MP4...")
-            
-            # Load audio
-            audio = AudioFileClip(str(mp3_path))
-            duration = audio.duration
-            
-            # Create background video
-            background = self.create_background_video(duration)
-            
-            # Download logos
-            logo_paths = self.download_logos()
-            
-            # Add logos to background
-            video_with_logos = self.add_logos_to_video(background, logo_paths)
-            
-            # Create audio visualization
-            audio_viz = self.create_audio_visualization(audio, duration)
-            
-            # Transcribe audio and create captions
-            transcription = self.transcribe_audio(mp3_path)
-            caption_segments = self.create_captions(transcription, duration)
-            
-            # Create caption clips
-            caption_clips = []
-            for segment in caption_segments:
-                caption_clip = self.create_caption_clip(
-                    segment["text"], 
-                    segment["start"], 
-                    segment["end"]
-                )
-                if caption_clip:
-                    caption_clips.append(caption_clip)
-            
-            # Combine video, audio visualization, and captions
-            video_clips = [video_with_logos]
-            if audio_viz:
-                # Position audio visualization at the bottom with proper spacing
-                viz_config = self.config.get("audio_visualization", {})
-                background_enabled = viz_config.get("background", {}).get("enabled", True)
-                
-                if background_enabled:
-                    # Position with background - it will extend below the main video
-                    viz_y = self.video_height - 20  # 20px margin from bottom
+            logger.info(f"Converting {audio_path.name}...")
+            duration = probe_duration(audio_path)
+            n_frames = int(np.ceil(duration * self.fps))
+            pcm = decode_audio(audio_path)
+            text = self.card_text(audio_path, meta_path, text_overrides or {})
+
+            with tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                self.build_background(text, self.download_logos()).save(work / "background.png")
+
+                inputs = ["-loop", "1", "-framerate", str(self.fps), "-i", "background.png",
+                          "-i", str(audio_path.resolve())]
+                video_chain = "[0:v]"
+                filters = []
+                viz = self.config["audio_visualization"]
+                if not viz["enabled"]:
+                    inputs.insert(0, "-nostdin")
                 else:
-                    # Position without background
-                    viz_y = self.video_height - audio_viz.h - 50  # 50px margin from bottom
-                
-                audio_viz = audio_viz.set_position((0, viz_y))
-                video_clips.append(audio_viz)
-            video_clips.extend(caption_clips)
-            
-            final_video = CompositeVideoClip(video_clips)
-            final_video = final_video.set_audio(audio)
-            
-            # Write output file
-            logger.info(f"Writing {output_filename}...")
-            
-            # Check if we need transparent output
-            transparent_bg = self.config.get("transparent_background", False)
-            
-            if transparent_bg:
-                # Use codec that supports alpha channel
-                codec = "libx264"  # or "prores_ks" for better alpha support
-                # Note: For true alpha support, you might want to use .mov format
-                # and prores_ks codec, but libx264 can work with some limitations
-                output_path = output_path.with_suffix('.mov')
-                logger.info(f"Writing transparent video to {output_path.name}...")
-            else:
-                codec = self.config["video_settings"]["codec"]
-            
-            final_video.write_videofile(
-                str(output_path),
-                fps=self.fps,
-                codec=codec,
-                audio_codec=self.config["video_settings"]["audio_codec"],
-                temp_audiofile='temp-audio.m4a',
-                remove_temp=True,
-                verbose=False,
-                logger=None
-            )
-            
-            # Clean up
-            audio.close()
-            final_video.close()
-            background.close()
-            
-            logger.info(f"Successfully converted {mp3_path.name} to {output_filename}")
+                    inputs += ["-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{viz['width']}x{viz['height']}",
+                               "-framerate", str(self.fps), "-i", "-"]
+                    filters.append(f"{video_chain}[2:v]overlay=(W-w)/2:{viz['y']}[withviz]")
+                    video_chain = "[withviz]"
+                if self.config["captions"]["enabled"]:
+                    segments = self.transcribe(audio_path, pcm, retranscribe)
+                    self.write_transcripts(segments, audio_path.stem)
+                    (work / "fonts").mkdir()
+                    shutil.copy(self.font_bold, work / "fonts")
+                    family = ImageFont.truetype(str(self.font_bold), 10).getname()[0]
+                    with open(work / "captions.ass", "w", encoding="utf-8", newline="\n") as f:
+                        f.write(self.build_captions(segments, family))
+                    # Relative paths: Windows drive letters break ffmpeg's filter syntax.
+                    filters.append(f"{video_chain}subtitles=captions.ass:fontsdir=fonts[withcaps]")
+                    video_chain = "[withcaps]"
+                filters.append(f"{video_chain}format=yuv420p[v]")
+
+                video = self.config["video"]
+                cmd = ["ffmpeg", "-y", "-v", "error", "-stats", *inputs,
+                       "-filter_complex", ";".join(filters), "-map", "[v]", "-map", "1:a",
+                       "-c:v", "libx264", "-preset", "medium", "-crf", str(video["crf"]), "-r", str(self.fps),
+                       "-c:a", "aac", "-b:a", video["audio_bitrate"], "-ar", "48000",
+                       "-t", f"{duration:.3f}", "-movflags", "+faststart", str(output_path.resolve())]
+
+                logger.info(f"Rendering {output_path.name}...")
+                proc = subprocess.Popen(cmd, cwd=work, stdin=subprocess.PIPE if viz["enabled"] else None)
+                if viz["enabled"]:
+                    try:
+                        for frame in self.visualizer_frames(pcm, n_frames):
+                            proc.stdin.write(frame)
+                    except BrokenPipeError:
+                        pass  # ffmpeg exited early; its error is reported below
+                    finally:
+                        proc.stdin.close()
+                if proc.wait():
+                    raise RuntimeError(f"ffmpeg exited with code {proc.returncode}")
+
+            logger.info(f"Successfully converted {audio_path.name} to {output_path}")
             return True
-            
+
         except Exception as e:
-            logger.error(f"Failed to convert {mp3_path.name}: {e}")
-            
-            # Clean up any partial output file that may have been created
+            logger.error(f"Failed to convert {audio_path.name}: {e}")
             if output_path.exists():
-                try:
-                    output_path.unlink()
-                    logger.info(f"Cleaned up failed output file: {output_filename}")
-                except Exception as cleanup_error:
-                    logger.warning(f"Could not clean up failed output file {output_filename}: {cleanup_error}")
-            
+                output_path.unlink()
             return False
-    
-    def process_all_files(self, force: bool = False) -> None:
-        """Process all MP3 files in the input folder"""
-        mp3_files = list(self.input_folder.glob("*.mp3"))
-        
-        if not mp3_files:
-            logger.info("No MP3 files found in input folder")
+
+    def process_all_files(self, files=None, **options) -> None:
+        files = files or sorted(p for p in self.input_folder.iterdir() if p.suffix.lower() in AUDIO_EXTS)
+        if not files:
+            logger.info(f"No audio files found in {self.input_folder}/")
             return
-        
-        logger.info(f"Found {len(mp3_files)} MP3 files to process")
-        
-        successful = 0
-        failed = 0
-        
-        for mp3_file in mp3_files:
-            if self.convert_mp3_to_mp4(mp3_file, force):
-                successful += 1
-            else:
-                failed += 1
-        
-        logger.info(f"Conversion complete: {successful} successful, {failed} failed")
+
+        logger.info(f"Found {len(files)} audio file(s) to process")
+        results = [self.convert(Path(f), **options) for f in files]
+        logger.info(f"Conversion complete: {sum(results)} successful, {len(results) - sum(results)} failed")
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert MP3 files to MP4 videos for social media")
-    parser.add_argument("-i", "--input", default="input", help="Input folder containing MP3 files")
+    parser = argparse.ArgumentParser(
+        description="Convert audio clips to vertical captioned MP4 videos for social media")
+    parser.add_argument("files", nargs="*", help="Audio files to convert (default: everything in the input folder)")
+    parser.add_argument("-i", "--input", default="input", help="Input folder containing audio files")
     parser.add_argument("-o", "--output", default="output", help="Output folder for MP4 files")
     parser.add_argument("-f", "--force", action="store_true", help="Force conversion even if output exists")
-    
+    parser.add_argument("--retranscribe", action="store_true", help="Ignore the cached transcript")
+    parser.add_argument("--config", default=str(ROOT / "config.json"), help="Path to config.json")
+    parser.add_argument("--meta", help="JSON file with title-card text (default: <audio name>.json next to the audio)")
+    for field in TEXT_FIELDS:
+        parser.add_argument(f"--{field}", help=f"Title-card {field} (overrides config and --meta)")
     args = parser.parse_args()
-    
-    # Create converter instance
-    converter = MP3ToMP4Converter(args.input, args.output)
-    
-    # Process all files
-    converter.process_all_files(args.force)
+
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+    require_ffmpeg()
+
+    converter = MP3ToMP4Converter(args.input, args.output, Path(args.config))
+    converter.process_all_files(
+        [Path(f) for f in args.files], force=args.force, retranscribe=args.retranscribe,
+        meta_path=args.meta, text_overrides={field: getattr(args, field) for field in TEXT_FIELDS})
+
 
 if __name__ == "__main__":
     main()

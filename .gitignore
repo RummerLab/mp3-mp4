@@ -1,4 +1,11 @@
 *.mp3
 *.mp4
 *.m4a
+*.wav
 *.png
+input/
+output/
+.cache/
+__pycache__/
+.venv/
+venv/
