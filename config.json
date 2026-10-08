@@ -1,91 +1,60 @@
 {
-    "video_settings": {
-        "width": 480,
-        "height": 854,
+    "video": {
         "fps": 30,
-        "codec": "libx264",
-        "audio_codec": "aac"
+        "crf": 18,
+        "audio_bitrate": "192k"
     },
     "background": {
-        "type": "gradient",
-        "colors": {
-            "top": [200, 100, 50],
-            "bottom": [100, 50, 20]
-        },
-        "overlay": {
-            "enabled": true,
-            "type": "subtle_pattern",
-            "opacity": 0.1
-        }
+        "top": [50, 100, 200],
+        "bottom": [12, 38, 84]
     },
-    "transparent_background": false,
     "logos": {
         "rummerlab": {
-            "url": "https://rummerlab.com/images/rummerlab_logo_transparent.png",
-            "position": "top-left",
-            "max_height": 180,
-            "max_width": 140,
-            "margin": 40,
-            "shadow": {
-                "enabled": false,
-                "offset": 1,
-                "blur": 4,
-                "color": [0, 0, 0, 100]
-            }
+            "url": "https://rummerlab.com/images/rummerlab_logo_transparent.png"
         },
         "physioshark": {
-            "url": "https://physioshark.org/images/logo-physioshark-project.png",
-            "position": "top-right",
-            "max_height": 160,
-            "max_width": 140,
-            "margin": 40,
-            "shadow": {
-                "enabled": false,
-                "offset": 1,
-                "blur": 4,
-                "color": [0, 0, 0, 100]
-            }
+            "url": "https://physioshark.org/images/logo-physioshark-project.png"
         }
     },
+    "text": {
+        "label": "",
+        "title": "Prof. Jodie Rummer",
+        "subtitle": "Marine biologist · James Cook University",
+        "date": "",
+        "topic": "",
+        "footer": "jodierummer.com"
+    },
+    "fonts": {
+        "regular": null,
+        "bold": null
+    },
     "captions": {
-        "font_size": 60,
-        "font_color": "white",
-        "stroke_color": "black",
-        "stroke_width": 3,
-        "position": "bottom",
-        "max_width": 980,
-        "words_per_segment": 5
+        "enabled": true,
+        "font_size": 76,
+        "color": [255, 255, 255],
+        "highlight_color": [150, 212, 255],
+        "max_chars": 26,
+        "y": 1290,
+        "corrections": {
+            "Jodi": "Jodie",
+            "Jody": "Jodie"
+        }
     },
     "audio_visualization": {
         "enabled": true,
-        "position": "bottom",
-        "height": 120,
-        "bar_width": 6,
-        "bar_spacing": 3,
-        "bar_color": [100, 200, 255],
-        "bar_alpha": 0.8,
-        "num_bars": 60,
-        "sensitivity": 2.0,
-        "smoothness": 0.3,
-        "gradient": {
-            "enabled": true,
-            "top_color": [150, 220, 255],
-            "bottom_color": [80, 160, 220]
-        },
-        "glow": {
-            "enabled": true,
-            "intensity": 0.3,
-            "color": [100, 200, 255]
-        },
-        "background": {
-            "enabled": true,
-            "color": [0, 0, 0, 150],
-            "height": 140,
-            "blur": 10
-        }
+        "y": 905,
+        "width": 900,
+        "height": 260,
+        "num_bars": 48,
+        "bar_width": 12,
+        "min_hz": 100,
+        "max_hz": 8000,
+        "center_color": [150, 220, 255],
+        "edge_color": [90, 170, 235]
     },
     "whisper": {
-        "model": "base",
-        "language": null
+        "model": "medium.en",
+        "language": "en",
+        "initial_prompt": "Professor Jodie Rummer, James Cook University, PhysioShark, RummerLab."
     }
 }

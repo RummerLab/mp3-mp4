@@ -1,227 +1,113 @@
 # MP3 to MP4 Converter for Social Media
 
-A Python script that converts MP3 audio files to MP4 videos optimized for social media platforms like YouTube Shorts, Instagram Reels, and TikTok. Features include:
+Turns an audio clip (an interview, a statement for the media, a podcast excerpt) into a
+vertical video ready for YouTube Shorts, Instagram Reels and TikTok:
 
-- **Portrait format** (9:16 aspect ratio) optimized for mobile viewing
-- **Auto-generated captions** using OpenAI's Whisper speech recognition
-- **Brand logos** automatically added to videos
-- **Ocean-themed gradient background** fitting for marine biology content
-- **Transparent background support** for overlay videos
-- **Batch processing** with skip/force options
+- **Portrait 1080x1920** (9:16), H.264 + AAC, 30 fps
+- **RummerLab and PhysioShark logos** on a white card, over an ocean-blue gradient
+- **Title card**: label, name, subtitle, date and a topic line
+- **Audio visualiser**: mirrored frequency bars that move with the voice
+- **Word-by-word captions** from a local [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+  transcription (no API key needed), with the spoken word highlighted
+- **`.srt` subtitles and a `.txt` transcript** alongside the video, for YouTube's subtitle
+  upload and the video description
 
-## Features
-
-- Converts MP3 files to MP4 videos in portrait format (1080x1920)
-- Automatically downloads and adds RummerLab and PhysioShark logos
-- Generates captions from audio using Whisper AI
-- Creates beautiful ocean-themed gradient backgrounds
-- Processes multiple files in batch
-- Skips already converted files (unless forced)
-- Comprehensive logging and error handling
+Rendering is done by FFmpeg, so a two-minute clip renders in about half a minute.
+Transcripts are cached, so re-rendering after changing the title text is quick.
 
 ## Installation
 
-1. **Clone or download this repository**
-   ```bash
-   git clone <repository-url>
-   cd mp3-mp4
-   ```
+1. **Install FFmpeg** (it must include libass, which the standard builds do)
+   - **Windows**: `winget install Gyan.FFmpeg` (or `scoop install ffmpeg`)
+   - **macOS**: `brew install ffmpeg`
+   - **Linux**: `sudo apt install ffmpeg`
 
-2. **Install Python dependencies**
+2. **Install the Python dependencies** (Python 3.10+)
    ```bash
+   python -m venv .venv
+   .venv/Scripts/activate        # macOS/Linux: source .venv/bin/activate
    pip install -r requirements.txt
    ```
 
-3. **Install FFmpeg** (required by MoviePy)
-   - **Windows**: Download from [FFmpeg website](https://ffmpeg.org/download.html) and add to PATH
-   - **macOS**: `brew install ffmpeg`
-   - **Linux**: `sudo apt install ffmpeg` (Ubuntu/Debian) or `sudo yum install ffmpeg` (CentOS/RHEL)
+The first run downloads the Whisper model (`medium.en`, about 1.5 GB) and the two logos.
 
-4. **Configure environment variables** (optional)
+## Making a video
+
+1. Put the audio file in `input/` (mp3, m4a, wav, aac, flac, ogg and opus all work).
+2. Run the converter, giving the title-card text for this clip:
    ```bash
-   python setup_env.py
+   python mp3_to_mp4_converter.py input/jodie-rummer-bbc-statement-2026-10-05.m4a \
+       --label "Statement for the BBC" \
+       --date "5 October 2026" \
+       --topic "Shark bites, climate change & physiology"
    ```
-   Or manually copy `env.template` to `.env` and edit the values.
+3. Collect the results from `output/`:
+   - `<name>.mp4`: the video
+   - `<name>.srt`: subtitles to upload in YouTube Studio (Subtitles → Upload file)
+   - `<name>.txt`: the transcript, handy for writing the description
+   - `<name>.transcript.json`: the cached word-timed transcript
 
-## Usage
+Check the captions before you upload. Whisper can mishear names: add fixes to
+`captions.corrections` in `config.json`, then re-run with `-f`. The cached transcript is
+reused, so this takes seconds.
 
-### Basic Usage
+### Title-card text
 
-1. **Create input and output folders** (automatically created if they don't exist)
-   ```
-   mp3-mp4/
-   ├── input/          # Place your MP3 files here
-   ├── output/         # Converted MP4 files will be saved here
-   └── mp3_to_mp4_converter.py
-   ```
+Each line is optional and is skipped if empty:
 
-2. **Place your MP3 files in the `input` folder**
+| Field      | Example                                   | Default (config.json)                     |
+|------------|-------------------------------------------|-------------------------------------------|
+| `label`    | Statement for the BBC (shown in capitals) |                                           |
+| `title`    | Prof. Jodie Rummer                        | Prof. Jodie Rummer                        |
+| `subtitle` | Marine biologist · James Cook University  | Marine biologist · James Cook University  |
+| `date`     | 5 October 2026                            |                                           |
+| `topic`    | Shark bites, climate change & physiology  |                                           |
+| `footer`   | jodierummer.com                           | jodierummer.com                           |
 
-3. **Run the converter**
-   ```bash
-   python mp3_to_mp4_converter.py
-   ```
+You can set them in three places. Each one overrides the one before:
 
-### Advanced Usage
+1. `text` in `config.json`: the defaults for every video
+2. A JSON file next to the audio with the same name (`input/<name>.json`), or one passed
+   with `--meta path/to/file.json`. See [`examples/`](examples/) for the BBC statement's.
+3. Command-line flags: `--label`, `--title`, `--subtitle`, `--date`, `--topic`, `--footer`
+
+### Command-line options
 
 ```bash
-# Use custom input/output folders
-python mp3_to_mp4_converter.py -i /path/to/input -o /path/to/output
-
-# Force conversion (overwrite existing files)
-python mp3_to_mp4_converter.py -f
-
-# Combine options
-python mp3_to_mp4_converter.py -i /path/to/input -o /path/to/output -f
+python mp3_to_mp4_converter.py                  # convert everything in input/
+python mp3_to_mp4_converter.py input/clip.mp3   # convert specific files
+python mp3_to_mp4_converter.py -f               # re-render even if the .mp4 exists
+python mp3_to_mp4_converter.py --retranscribe   # ignore the cached transcript
+python mp3_to_mp4_converter.py -i in -o out     # custom input/output folders
+python mp3_to_mp4_converter.py --config other.json
 ```
 
-### Command Line Options
+## Configuration (`config.json`)
 
-- `-i, --input`: Input folder containing MP3 files (default: "input")
-- `-o, --output`: Output folder for MP4 files (default: "output")
-- `-f, --force`: Force conversion even if output file already exists
+| Section               | What it controls                                                        |
+|-----------------------|-------------------------------------------------------------------------|
+| `video`               | Frame rate, x264 quality (`crf`, lower is better), audio bitrate        |
+| `background`          | Gradient colours, top and bottom, as RGB                                |
+| `logos`               | Logo URLs shown on the white card, left to right (downloaded to `.cache/`) |
+| `text`                | Default title-card text (see above)                                     |
+| `fonts`               | `regular`/`bold` `.ttf` paths. If unset, uses Segoe UI (Windows), Arial (macOS) or DejaVu Sans (Linux). |
+| `captions`            | On/off, size, colours, line length, vertical position, name `corrections` |
+| `audio_visualization` | On/off, position, size, number of bars, frequency range, colours        |
+| `whisper`             | Model (`small.en` is faster, `medium.en` more accurate), language, and an `initial_prompt` that helps with names |
 
-## Output Specifications
+## Uploading to YouTube
 
-- **Resolution**: 1080x1920 (portrait format)
-- **Frame rate**: 30 FPS
-- **Codec**: H.264 video, AAC audio
-- **Aspect ratio**: 9:16 (optimized for mobile/social media)
-- **Background**: Ocean-themed gradient (blue tones) or transparent
-- **Logos**: RummerLab (top-left) and PhysioShark (top-right)
-- **Captions**: White text with black outline, positioned at bottom
-- **Transparency**: Optional alpha channel support for overlay videos
-
-## Logo Sources
-
-The script automatically downloads logos from:
-- **RummerLab**: https://rummerlab.com/images/rummerlab_logo_transparent.png
-- **PhysioShark**: https://physioshark.org/images/logo-physioshark-project.png
-
-## Environment Variables
-
-The converter supports environment variables for configuration. Create a `.env` file or use the setup script:
-
-```bash
-python setup_env.py
-```
-
-### Key Environment Variables
-
-- **`OPENAI_API_KEY`**: Your OpenAI API key for Whisper transcription
-- **`VIDEO_WIDTH`**: Video width (default: 480)
-- **`VIDEO_HEIGHT`**: Video height (default: 854)
-- **`ENABLE_CAPTIONS`**: Enable/disable captions (true/false)
-- **`ENABLE_LOGOS`**: Enable/disable logos (true/false)
-- **`BG_TOP_RED/GREEN/BLUE`**: Background gradient top color (RGB)
-- **`BG_BOTTOM_RED/GREEN/BLUE`**: Background gradient bottom color (RGB)
-- **`TRANSPARENT_BACKGROUND`**: Enable transparent background (true/false)
-
-See `env.template` for all available options.
-
-## Caption Generation
-
-The script uses OpenAI's Whisper model to:
-1. Transcribe the audio content (local model or API)
-2. Segment the text into readable chunks
-3. Time-sync captions with the audio
-4. Display captions with professional styling
-
-### Caption Options
-
-- **Local Whisper**: Uses local model (requires more disk space)
-- **OpenAI API**: Uses cloud API (requires API key, faster)
-- **Disabled**: Skip captions entirely
-
-### Transparent Background
-
-To create videos with transparent backgrounds (useful for overlays):
-
-1. **Set environment variable**:
-   ```bash
-   export TRANSPARENT_BACKGROUND=true
-   ```
-
-2. **Or modify config.json**:
-   ```json
-   {
-     "transparent_background": true
-   }
-   ```
-
-3. **Output format**: Videos will be saved as `.mov` files with alpha channel support
-
-**Note**: Transparent videos are ideal for:
-- Overlaying on other videos
-- Creating video effects
-- Professional video editing workflows
+- Clips of up to 3 minutes in this vertical format are published as **Shorts**.
+- Upload the `.srt` under **Subtitles** so viewers can turn on captions and search can index
+  the transcript. The burned-in captions stay on screen either way.
+- YouTube's Shorts buttons and title cover the bottom fifth and the right edge of the
+  frame, so the title card, visualiser and captions sit in the upper two-thirds.
 
 ## Troubleshooting
 
-### Common Issues
-
-1. **FFmpeg not found**
-   - Install FFmpeg and ensure it's in your system PATH
-   - Restart your terminal after installation
-
-2. **Missing dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Whisper model download issues**
-   - The script will continue without captions if Whisper fails to load
-   - Check your internet connection for initial model download
-
-4. **Logo download failures**
-   - The script will continue without logos if downloads fail
-   - Check your internet connection and logo URLs
-
-### Performance Tips
-
-- **First run**: May take longer as Whisper model downloads (~1GB)
-- **Large files**: Consider processing during off-peak hours
-- **Storage**: Ensure sufficient disk space for video output
-- **Memory**: Video processing can be memory-intensive
-
-## Example Workflow
-
-```bash
-# 1. Install dependencies
-pip install -r requirements.txt
-
-# 2. Place MP3 files in input folder
-cp /path/to/your/interviews/*.mp3 input/
-
-# 3. Run conversion
-python mp3_to_mp4_converter.py
-
-# 4. Check output folder for MP4 files
-ls output/
-```
-
-## File Structure
-
-```
-mp3-mp4/
-├── input/                          # MP3 input files
-│   ├── interview1.mp3
-│   ├── interview2.mp3
-│   └── ...
-├── output/                         # MP4 output files
-│   ├── interview1.mp4
-│   ├── interview2.mp4
-│   ├── rummerlab_logo.png         # Downloaded logos
-│   └── physioshark_logo.png
-├── mp3_to_mp4_converter.py        # Main script
-├── requirements.txt               # Python dependencies
-└── README.md                     # This file
-```
-
-## License
-
-This project is open source. Feel free to modify and distribute as needed.
-
-## Support
-
-For issues or questions, please check the troubleshooting section above or create an issue in the repository.
+- **`ffmpeg not found`**: install FFmpeg and restart your terminal so it is on `PATH`.
+- **`No bold font found`**: set `fonts.bold` and `fonts.regular` in `config.json` to `.ttf` files.
+- **Logo download failures**: the video is still made, just without that logo. Check the
+  URLs in `config.json`.
+- **Wrong words in the captions**: add them to `captions.corrections`, or put the right
+  spelling in `whisper.initial_prompt` and re-run with `--retranscribe`.
